@@ -1,0 +1,40 @@
+# Decompiled game resources (large/generated)
+/decompiled_resources/
+
+# Logs
+*.log
+
+# Local service runtime logs
+/server/logs/
+/server/**/logs/
+
+# Local docs
+/localdocs/
+
+# Local service state
+/server/data/
+
+# Extracted game resources (do not commit)
+/server/src/Dependencies/*.dll
+/server/static-data/*.json
+/server/StreamingAssets/**
+
+# Extracted game resources accidentally copied into the C# host project
+/server/src/Shadowrun.LocalService.Host/Resources/
+
+# Visual Studio / MSBuild
+/.vs/
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+**/*.sln.cache
+
+# .NET / C# build artifacts
+**/bin/
+**/obj/
+**/TestResults/
+
+# Python build artifacts
+/build/
+/.venv/
