@@ -85,59 +85,109 @@ namespace Shadowrun.LocalService.Core.Persistence
 
             lock (_lock)
             {
-                var account = LoadAccountNoThrow();
                 var steamKey = steamId64.ToString(CultureInfo.InvariantCulture);
+                var steamDisplayName = "Steam:" + steamKey;
 
-                // Store mapping in account.json so identities remain stable across restarts.
-                // Schema:
-                //   SteamIdentities: { "7656119...": "<identity-guid>" }
-                //   SteamId64: "7656119..." (last/active)
-                var steamIdentities = GetOrCreateDict(account, "SteamIdentities");
+                // Store mapping at the account-store root so multiple identities can coexist.
+                var store = LoadAccountStoreNoThrow(true);
+                var steamIdentities = GetOrCreateDict(store, "SteamIdentities");
+
                 var mapped = GetString(steamIdentities, steamKey);
                 if (IsGuidish(mapped))
                 {
                     var normalized = NormalizeGuidish(mapped);
-                    account["IdentityHash"] = normalized;
-                    account["SteamId64"] = steamKey;
-                    SaveAccountNoThrow(account);
+                    store["SteamId64"] = steamKey;
+
+                    // Ensure the account exists in this same store instance.
+                    var accounts = GetOrCreateDict(store, "Accounts");
+                    var existingAccount = GetDict(accounts, normalized);
+                    if (existingAccount == null)
+                    {
+                        var createdAccount = BuildFreshAccountForIdentity(normalized);
+                        createdAccount["DisplayName"] = steamDisplayName;
+                        createdAccount["Careers"] = BuildDefaultCareers(normalized);
+                        accounts[normalized] = createdAccount;
+                    }
+                    else
+                    {
+                        // If the account is still on the old default name, upgrade to Steam:{id}.
+                        var existingDisplayName = GetString(existingAccount, "DisplayName");
+                        if (IsNullOrWhiteSpace(existingDisplayName) || string.Equals(existingDisplayName, "OfflineRunner", StringComparison.OrdinalIgnoreCase))
+                        {
+                            existingAccount["DisplayName"] = steamDisplayName;
+                        }
+                    }
+
+                    SaveAccountStoreNoThrow(store);
                     return normalized;
                 }
 
-                // Migration: if we have an existing single IdentityHash, bind it to this steam id.
-                var existingIdentity = GetString(account, "IdentityHash");
-                if (IsGuidish(existingIdentity))
+                // Migration: if we have exactly one existing account and no mapping, bind it to this steam id.
+                // (Prevents accidentally remapping a multi-account store.)
+                try
                 {
-                    var normalized = NormalizeGuidish(existingIdentity);
-                    steamIdentities[steamKey] = normalized;
-                    account["SteamId64"] = steamKey;
-                    SaveAccountNoThrow(account);
-                    return normalized;
+                    var accounts = GetOrCreateDict(store, "Accounts");
+                    var count = accounts is ICollection ? ((ICollection)accounts).Count : 0;
+                    var hasAnyMapping = steamIdentities is ICollection && ((ICollection)steamIdentities).Count > 0;
+                    if (!hasAnyMapping && count == 1)
+                    {
+                        foreach (DictionaryEntry entry in accounts)
+                        {
+                            var key = entry.Key as string;
+                            if (IsGuidish(key))
+                            {
+                                var normalized = NormalizeGuidish(key);
+                                steamIdentities[steamKey] = normalized;
+                                store["SteamId64"] = steamKey;
+
+                                // If the single legacy account has no meaningful name, seed Steam:{id}.
+                                var acct = GetDict(accounts, normalized);
+                                if (acct != null)
+                                {
+                                    var existingDisplayName = GetString(acct, "DisplayName");
+                                    if (IsNullOrWhiteSpace(existingDisplayName) || string.Equals(existingDisplayName, "OfflineRunner", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        acct["DisplayName"] = steamDisplayName;
+                                    }
+                                }
+
+                                SaveAccountStoreNoThrow(store);
+                                return normalized;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
                 }
 
                 // First-time identity for this Steam user.
-                var created = Guid.NewGuid().ToString();
+                var created = NormalizeGuidish(Guid.NewGuid().ToString());
                 steamIdentities[steamKey] = created;
-                account["IdentityHash"] = created;
-                account["SteamId64"] = steamKey;
-                if (IsNullOrWhiteSpace(GetString(account, "DisplayName")))
-                {
-                    account["DisplayName"] = "OfflineRunner";
-                }
-                if (account["Careers"] == null)
-                {
-                    account["Careers"] = BuildDefaultCareers(created);
-                }
+                store["SteamId64"] = steamKey;
 
-                SaveAccountNoThrow(account);
-                return NormalizeGuidish(created);
+                // Create account directly under Accounts.
+                var accountsForCreate = GetOrCreateDict(store, "Accounts");
+                var createdAccountForStore = BuildFreshAccountForIdentity(created);
+                createdAccountForStore["DisplayName"] = steamDisplayName;
+                createdAccountForStore["Careers"] = BuildDefaultCareers(created);
+                accountsForCreate[created] = createdAccountForStore;
+
+                SaveAccountStoreNoThrow(store);
+                return created;
             }
         }
 
         public string GetDisplayName()
         {
+            return GetDisplayName(GetOrCreateIdentityHash());
+        }
+
+        public string GetDisplayName(string identityHash)
+        {
             lock (_lock)
             {
-                var account = LoadAccountNoThrow();
+                var account = LoadAccountForIdentityNoThrow(identityHash, true) ?? LoadAccountNoThrow();
                 var displayName = GetString(account, "DisplayName");
                 if (IsNullOrWhiteSpace(displayName))
                 {
@@ -151,14 +201,24 @@ namespace Shadowrun.LocalService.Core.Persistence
 
         public int GetLastCareerIndex()
         {
+            return GetLastCareerIndex(GetOrCreateIdentityHash());
+        }
+
+        public int GetLastCareerIndex(string identityHash)
+        {
             lock (_lock)
             {
-                var account = LoadAccountNoThrow();
+                var account = LoadAccountForIdentityNoThrow(identityHash, true) ?? LoadAccountNoThrow();
                 return GetInt(account, "LastCareerIndex", 0);
             }
         }
 
         public void SetLastCareerIndex(int index)
+        {
+            SetLastCareerIndex(GetOrCreateIdentityHash(), index);
+        }
+
+        public void SetLastCareerIndex(string identityHash, int index)
         {
             if (index < 0)
             {
@@ -167,7 +227,7 @@ namespace Shadowrun.LocalService.Core.Persistence
 
             lock (_lock)
             {
-                var account = LoadAccountNoThrow();
+                var account = LoadAccountForIdentityNoThrow(identityHash, true) ?? LoadAccountNoThrow();
                 account["LastCareerIndex"] = index;
                 SaveAccountNoThrow(account);
             }
@@ -316,14 +376,19 @@ namespace Shadowrun.LocalService.Core.Persistence
 
         public List<CareerSlot> GetCareers()
         {
+            return GetCareers(GetOrCreateIdentityHash());
+        }
+
+        public List<CareerSlot> GetCareers(string identityHash)
+        {
             lock (_lock)
             {
-                var account = LoadAccountNoThrow();
+                var account = LoadAccountForIdentityNoThrow(identityHash, true) ?? LoadAccountNoThrow();
                 var careersObj = account["Careers"];
                 var careersList = CoerceToArrayList(careersObj);
                 if (careersList == null)
                 {
-                    var identity = GetOrCreateIdentityHash();
+                    var identity = IsGuidish(identityHash) ? NormalizeGuidish(identityHash) : GetOrCreateIdentityHash();
                     careersList = BuildDefaultCareers(identity);
                     account["Careers"] = careersList;
                     SaveAccountNoThrow(account);
@@ -358,10 +423,15 @@ namespace Shadowrun.LocalService.Core.Persistence
 
         public CareerSlot GetOrCreateCareer(int index, bool markOccupied)
         {
+            return GetOrCreateCareer(GetOrCreateIdentityHash(), index, markOccupied);
+        }
+
+        public CareerSlot GetOrCreateCareer(string identityHash, int index, bool markOccupied)
+        {
             lock (_lock)
             {
-                var identity = GetOrCreateIdentityHash();
-                var account = LoadAccountNoThrow();
+                var identity = IsGuidish(identityHash) ? NormalizeGuidish(identityHash) : GetOrCreateIdentityHash();
+                var account = LoadAccountForIdentityNoThrow(identity, true) ?? LoadAccountNoThrow();
                 var careersObj = account["Careers"];
                 var careersList = CoerceToArrayList(careersObj);
                 if (careersList == null)
@@ -575,6 +645,11 @@ namespace Shadowrun.LocalService.Core.Persistence
 
         public void UpsertCareer(CareerSlot slot)
         {
+            UpsertCareer(GetOrCreateIdentityHash(), slot);
+        }
+
+        public void UpsertCareer(string identityHash, CareerSlot slot)
+        {
             if (slot == null)
             {
                 return;
@@ -582,8 +657,8 @@ namespace Shadowrun.LocalService.Core.Persistence
 
             lock (_lock)
             {
-                var identity = GetOrCreateIdentityHash();
-                var account = LoadAccountNoThrow();
+                var identity = IsGuidish(identityHash) ? NormalizeGuidish(identityHash) : GetOrCreateIdentityHash();
+                var account = LoadAccountForIdentityNoThrow(identity, true) ?? LoadAccountNoThrow();
 
                 var careersObj = account["Careers"];
                 var careersList = CoerceToArrayList(careersObj);
@@ -634,6 +709,11 @@ namespace Shadowrun.LocalService.Core.Persistence
 
         public CareerSlot DeactivateCareerSlot(int index, string hubId)
         {
+            return DeactivateCareerSlot(GetOrCreateIdentityHash(), index, hubId);
+        }
+
+        public CareerSlot DeactivateCareerSlot(string identityHash, int index, string hubId)
+        {
             if (index < 0)
             {
                 index = 0;
@@ -641,8 +721,8 @@ namespace Shadowrun.LocalService.Core.Persistence
 
             lock (_lock)
             {
-                var identity = GetOrCreateIdentityHash();
-                var account = LoadAccountNoThrow();
+                var identity = IsGuidish(identityHash) ? NormalizeGuidish(identityHash) : GetOrCreateIdentityHash();
+                var account = LoadAccountForIdentityNoThrow(identity, true) ?? LoadAccountNoThrow();
 
                 var careersObj = account["Careers"];
                 var careersList = CoerceToArrayList(careersObj);

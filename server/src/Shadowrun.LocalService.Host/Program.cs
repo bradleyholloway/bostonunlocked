@@ -53,7 +53,7 @@ namespace Shadowrun.LocalService.Host
 			var userStore = new LocalUserStore(options, logger);
 			var sessionIdentityMap = new ExpiringSessionIdentityMap();
 			var httpServer = new HttpStubServer(options, logger, userStore, sessionIdentityMap, null);
-			var aplayStub = new APlayTcpStub(options, logger, userStore);
+			var aplayStub = new APlayTcpStub(options, logger, userStore, sessionIdentityMap);
 			var photonStub = new PhotonProxyTcpStub(options, logger, userStore, sessionIdentityMap);
 
 			Exception httpError = null;

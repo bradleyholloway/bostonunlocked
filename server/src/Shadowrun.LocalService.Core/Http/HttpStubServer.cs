@@ -240,16 +240,16 @@ namespace Shadowrun.LocalService.Core.Http
             {
                 // Session hashes do not need to persist across service restarts in offline mode.
                 // Keep them in-memory and prune them by TTL.
-                var identity = _userStore != null ? _userStore.GetOrCreateIdentityHash() : "22222222-2222-2222-2222-222222222222";
                 var session = Guid.NewGuid();
 
-                // Best-effort: extract SteamID64 from the ticket. This lets us later assign stable,
-                // unique identities per Steam user.
+                ulong steamId = 0;
+                string identity = null;
+
+                // Enforced: require a usable SteamID64 from the auth ticket.
                 try
                 {
                     var dict = TryParseJsonDictionary(bodyBytes);
                     var ticketHex = GetString(dict, "Ticket");
-                    ulong steamId;
                     if (TryExtractSteamId64FromAuthTicketHex(ticketHex, out steamId))
                     {
                         if (_userStore != null)
@@ -268,10 +268,29 @@ namespace Shadowrun.LocalService.Core.Http
                 }
                 catch
                 {
+                    steamId = 0;
+                    identity = null;
                 }
 
-                try { _sessionIdentityMap.SetIdentityForSession(session.ToString(), identity); }
-                catch { }
+                if (steamId == 0 || IsNullOrWhiteSpace(identity))
+                {
+                    return JsonResponse(200, new Dictionary<string, object>
+                    {
+                        { "Code", 1 },
+                        { "Message", "SteamError" },
+                        { "SessionHash", Guid.Empty.ToString() },
+                        {
+                            "SteamError",
+                            new Dictionary<string, object>
+                            {
+                                { "Code", 1 },
+                                { "Description", "Missing or invalid Steam auth ticket (SteamID64 not found)." },
+                            }
+                        },
+                    });
+                }
+
+                try { _sessionIdentityMap.SetIdentityForSession(session.ToString(), identity); } catch { }
                 return JsonResponse(200, new Dictionary<string, object>
                 {
                     { "Code", 0 },
@@ -290,9 +309,8 @@ namespace Shadowrun.LocalService.Core.Http
 
             if (EndsWith(path, "/Accounts/GetAccountForHash"))
             {
-                // Prefer an existing mapping if we have one (e.g., minted in Steam/Authenticate).
-                // Important: don't overwrite an existing session->identity mapping with a default.
-                var identity = _userStore != null ? _userStore.GetOrCreateIdentityHash() : "22222222-2222-2222-2222-222222222222";
+                // Enforced: require session hash -> identity mapping (minted in Steam/Authenticate).
+                string identity = null;
                 string sessionHash = null;
                 try
                 {
@@ -310,13 +328,22 @@ namespace Shadowrun.LocalService.Core.Http
                     {
                         identity = mapped;
                     }
-                    else if (!IsNullOrWhiteSpace(sessionHash))
-                    {
-                        _sessionIdentityMap.SetIdentityForSession(sessionHash, identity);
-                    }
                 }
                 catch
                 {
+                }
+
+                if (IsNullOrWhiteSpace(sessionHash) || IsNullOrWhiteSpace(identity))
+                {
+                    return JsonResponse(200, new Dictionary<string, object>
+                    {
+                        { "IdentityHash", Guid.Empty.ToString() },
+                        { "ApplicationKeyName", "SRO-GAME-KEY" },
+                        { "GameName", "SRO" },
+                        { "IsGameBorrowed", false },
+                        { "Code", 1 },
+                        { "Message", "IdentityNotFound" },
+                    });
                 }
 
                 return JsonResponse(200, new Dictionary<string, object>
@@ -325,6 +352,8 @@ namespace Shadowrun.LocalService.Core.Http
                     { "ApplicationKeyName", "SRO-GAME-KEY" },
                     { "GameName", "SRO" },
                     { "IsGameBorrowed", false },
+                    { "Code", 0 },
+                    { "Message", "OK" },
                 });
             }
 
@@ -333,7 +362,12 @@ namespace Shadowrun.LocalService.Core.Http
                 var requestedIdentityHashes = ParseRequestedIdentityHashes(bodyBytes);
                 if (requestedIdentityHashes.Count == 0)
                 {
-                    requestedIdentityHashes.Add(_userStore != null ? _userStore.GetOrCreateIdentityHash() : "22222222-2222-2222-2222-222222222222");
+                    return JsonResponse(200, new Dictionary<string, object>
+                    {
+                        { "PlayerInfoResults", new object[0] },
+                        { "Code", 1 },
+                        { "Message", "IdentityNotFound" },
+                    });
                 }
 
                 var requestedKeys = ParseRequestedKeys(bodyBytes);
@@ -381,7 +415,7 @@ namespace Shadowrun.LocalService.Core.Http
                     var stored = _playerInfoRepository.Get(identityHash, requestedGameName);
                     if (stored != null && _userStore != null && !stored.ContainsKey("LauncherDisplayName"))
                     {
-                        stored["LauncherDisplayName"] = _userStore.GetDisplayName();
+                        stored["LauncherDisplayName"] = _userStore.GetDisplayName(identityHash);
                     }
                     var responseInfo = BuildPlayerInfoResponse(stored, requestedKeys);
 
@@ -442,7 +476,14 @@ namespace Shadowrun.LocalService.Core.Http
                 }
                 if (IsNullOrWhiteSpace(identityHash))
                 {
-                    identityHash = _userStore != null ? _userStore.GetOrCreateIdentityHash() : "22222222-2222-2222-2222-222222222222";
+                    return JsonResponse(200, new Dictionary<string, object>
+                    {
+                        { "Added", new Dictionary<string, string>() },
+                        { "Updated", new Dictionary<string, string>() },
+                        { "Deleted", new string[0] },
+                        { "Code", 1 },
+                        { "Message", "IdentityNotFound" },
+                    });
                 }
 
                 var playerInfoUpdates = ParsePlayerInfoUpdates(dict);
@@ -477,14 +518,14 @@ namespace Shadowrun.LocalService.Core.Http
                         var characterName = displayName.Substring(semi + 1).Trim();
                         if (!IsNullOrWhiteSpace(characterName))
                         {
-                            var slotIndex = _userStore.GetLastCareerIndex();
-                            var slot = _userStore.GetOrCreateCareer(slotIndex, false);
+                            var slotIndex = _userStore.GetLastCareerIndex(identityHash);
+                            var slot = _userStore.GetOrCreateCareer(identityHash, slotIndex, false);
                             if (slot != null && !string.Equals(slot.CharacterName, characterName, StringComparison.Ordinal))
                             {
                                 slot.CharacterName = characterName;
                                 slot.IsOccupied = true;
                                 slot.PendingPersistenceCreation = false;
-                                _userStore.UpsertCareer(slot);
+                                _userStore.UpsertCareer(identityHash, slot);
                             }
                         }
                     }

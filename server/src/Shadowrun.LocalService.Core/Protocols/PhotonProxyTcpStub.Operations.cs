@@ -175,6 +175,27 @@ namespace Shadowrun.LocalService.Core.Protocols
                 {
                     var req = DeserializeMessage<ConnectRequest>(requestPayload);
                     var accountId = ResolveAccountIdFromSession(req != null ? req.AccountSystemSession : Guid.Empty);
+
+                    if (accountId == Guid.Empty)
+                    {
+                        try
+                        {
+                            _logger.Log(new
+                            {
+                                ts = RequestLogger.UtcNowIso(),
+                                type = "photon",
+                                op = "connect-rejected",
+                                reason = "missing-or-unmapped-account-system-session",
+                                sessionHash = req != null ? req.AccountSystemSession.ToString() : Guid.Empty.ToString(),
+                            });
+                        }
+                        catch
+                        {
+                        }
+
+                        return new DisconnectResponse();
+                    }
+
                     state.AccountId = accountId;
                     state.LocalUser = CreateUser(accountId);
 
@@ -328,14 +349,8 @@ namespace Shadowrun.LocalService.Core.Protocols
             {
             }
 
-            try
-            {
-                return _userStore != null ? new Guid(_userStore.GetOrCreateIdentityHash()) : Guid.Empty;
-            }
-            catch
-            {
-                return Guid.Empty;
-            }
+            // Enforced: do not fall back to a global/default identity.
+            return Guid.Empty;
         }
 
         private static User CreateUser(Guid accountId)

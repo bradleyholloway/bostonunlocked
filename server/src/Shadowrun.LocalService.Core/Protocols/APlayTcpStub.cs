@@ -1527,6 +1527,7 @@ namespace Shadowrun.LocalService.Core.Protocols
         private readonly LocalServiceOptions _options;
         private readonly RequestLogger _logger;
         private readonly LocalUserStore _userStore;
+        private readonly ISessionIdentityMap _sessionIdentityMap;
         private readonly CareerInfoGenerator _careerInfoGenerator;
         private readonly MatchConfigurationGenerator _matchConfigurationGenerator;
 
@@ -1621,15 +1622,21 @@ namespace Shadowrun.LocalService.Core.Protocols
         }
 
         public APlayTcpStub(LocalServiceOptions options, RequestLogger logger)
-            : this(options, logger, new LocalUserStore(options, logger))
+            : this(options, logger, new LocalUserStore(options, logger), null)
         {
         }
 
         public APlayTcpStub(LocalServiceOptions options, RequestLogger logger, LocalUserStore userStore)
+            : this(options, logger, userStore, null)
+        {
+        }
+
+        public APlayTcpStub(LocalServiceOptions options, RequestLogger logger, LocalUserStore userStore, ISessionIdentityMap sessionIdentityMap)
         {
             _options = options;
             _logger = logger;
             _userStore = userStore ?? new LocalUserStore(options, logger);
+            _sessionIdentityMap = sessionIdentityMap;
             _careerInfoGenerator = new CareerInfoGenerator(logger);
             _matchConfigurationGenerator = new MatchConfigurationGenerator(logger);
         }
@@ -1695,7 +1702,7 @@ namespace Shadowrun.LocalService.Core.Protocols
             }
         }
 
-        private bool TryAdvanceMainCampaignIfEligible(CareerSlot slot, string peer, NetworkStream stream, string storylineName, ulong msgNoBase, ref byte[] cachedHubStatePayload, byte[] cachedCreationInfoPayload, bool nudgeClient)
+        private bool TryAdvanceMainCampaignIfEligible(string identityHash, CareerSlot slot, string peer, NetworkStream stream, string storylineName, ulong msgNoBase, ref byte[] cachedHubStatePayload, byte[] cachedCreationInfoPayload, bool nudgeClient)
         {
             if (slot == null)
             {
@@ -1763,9 +1770,9 @@ namespace Shadowrun.LocalService.Core.Protocols
                 slot.HubId = next.Hub;
             }
 
-            if (_userStore != null)
+            if (_userStore != null && !IsNullOrWhiteSpace(identityHash))
             {
-                try { _userStore.UpsertCareer(slot); } catch { }
+                try { _userStore.UpsertCareer(identityHash, slot); } catch { }
             }
 
             // Broadcast ChapterChange via StoryprogressChanged.
@@ -1935,11 +1942,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                     long metaRequestHubSeen = 0;
                     long postCreateArmGeneration = 0;
 
-                    // Persisted local identity + currently selected career slot (used for match config generation).
-                    var activeIdentityHash = _userStore != null ? _userStore.GetOrCreateIdentityHash() : Guid.NewGuid().ToString();
-                    Guid activeIdentityGuid;
-                    try { activeIdentityGuid = new Guid(activeIdentityHash); }
-                    catch { activeIdentityGuid = Guid.NewGuid(); }
+                    // Per-connection identity resolved from RequestToLogin(sessionHash, deviceModel, loginMethod).
+                    // Enforced: no fallback to a global/default identity.
+                    string activeIdentityHash = null;
+                    Guid activeIdentityGuid = Guid.Empty;
                     var activeCareerIndex = 0;
                     var activeCharacterName = "OfflineRunner";
 
@@ -2107,6 +2113,51 @@ namespace Shadowrun.LocalService.Core.Protocols
                             if (isRegularConnect && !sentRegularConnectReply)
                             {
                                 var serverMsgNoBase = direct.Value.MsgNo;
+
+                                // RequestToLogin(sessionHash, deviceModel, loginMethod). The loginMethod is typically "RegularConnect".
+                                // Enforced: the session hash must map to a known identity (minted via Steam/Authenticate).
+                                var requestedSessionHash = payloadStrings.Count > 0 ? payloadStrings[0] : null;
+                                string mappedIdentityHash = null;
+                                Guid mappedIdentityGuid = Guid.Empty;
+                                string rejectReason = null;
+
+                                if (IsNullOrWhiteSpace(requestedSessionHash))
+                                {
+                                    rejectReason = "Missing session hash.";
+                                }
+                                else
+                                {
+                                    try
+                                    {
+                                        // Validate the session hash is a GUID (matches AccountSystem SessionHash).
+                                        var _ = new Guid(requestedSessionHash);
+
+                                        // Resolve identity from shared session map (preferred) or persisted user store sessions.
+                                        if (_sessionIdentityMap != null && _sessionIdentityMap.TryGetIdentityForSession(requestedSessionHash, out mappedIdentityHash) && !IsNullOrWhiteSpace(mappedIdentityHash))
+                                        {
+                                            // ok
+                                        }
+                                        else if (_userStore != null && _userStore.TryGetIdentityForSession(requestedSessionHash, out mappedIdentityHash) && !IsNullOrWhiteSpace(mappedIdentityHash))
+                                        {
+                                            // ok
+                                        }
+                                        else
+                                        {
+                                            rejectReason = "Unknown session hash (no mapped identity).";
+                                        }
+
+                                        if (rejectReason == null)
+                                        {
+                                            try { mappedIdentityGuid = new Guid(mappedIdentityHash); }
+                                            catch { rejectReason = "Mapped identity hash is invalid."; }
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        rejectReason = "Invalid session hash.";
+                                    }
+                                }
+
                                 SleepWithStop(stopEvent, 250);
 
                                 if (!sentAccountIntro)
@@ -2123,7 +2174,19 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 var accountOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(2, 3), serverMsgNoBase + 3);
                                 SendRawFrame(stream, peer, PrefixLength(accountOwnerCore), "sent AP shared-entity set-owner (entity=2)");
 
-                                var careerSummary = BuildCareerSummaryJson(_userStore != null ? _userStore.GetCareers() : null);
+                                if (rejectReason != null)
+                                {
+                                    var rejectPayload = BuildUtf16StringPayload(rejectReason);
+                                    var rejectCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 5, rejectPayload), serverMsgNoBase + 4);
+                                    SendRawFrame(stream, peer, PrefixLength(rejectCore), "sent GameClientConnection RejectLogin in response to RegularConnect");
+                                    connectionClosed.Set();
+                                    return;
+                                }
+
+                                activeIdentityHash = mappedIdentityHash;
+                                activeIdentityGuid = mappedIdentityGuid;
+
+                                var careerSummary = BuildCareerSummaryJson(_userStore != null ? _userStore.GetCareers(activeIdentityHash) : null);
                                 var welcomePayload = BuildGameClientWelcomePayload(2, careerSummary);
                                 var welcomeCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 4, welcomePayload), serverMsgNoBase + 4);
                                 SendRawFrame(stream, peer, PrefixLength(welcomeCore), "sent GameClientConnection Welcome in response to RegularConnect");
@@ -2212,16 +2275,23 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     sentHubIntro = true;
                                 }
 
-                                // Resolve persisted identity + career slot.
-                                var identityHash = _userStore != null ? _userStore.GetOrCreateIdentityHash() : Guid.NewGuid().ToString();
-                                Guid identityGuid;
-                                try { identityGuid = new Guid(identityHash); }
-                                catch { identityGuid = Guid.NewGuid(); }
+                                // Enforced: identity must have been established during RegularConnect (RequestToLogin).
+                                if (IsNullOrWhiteSpace(activeIdentityHash) || activeIdentityGuid == Guid.Empty)
+                                {
+                                    var rejectPayload = BuildUtf16StringPayload("Not logged in.");
+                                    var rejectCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 5, rejectPayload), serverMsgNoBase + 4);
+                                    SendRawFrame(stream, peer, PrefixLength(rejectCore), "sent GameClientConnection RejectLogin (EnterCareer before login)");
+                                    connectionClosed.Set();
+                                    return;
+                                }
+
+                                var identityHash = activeIdentityHash;
+                                var identityGuid = activeIdentityGuid;
 
                                 CareerSlot slot = null;
                                 if (_userStore != null)
                                 {
-                                    slot = _userStore.GetOrCreateCareer(careerIndex, isCreateCareer);
+                                    slot = _userStore.GetOrCreateCareer(identityHash, careerIndex, isCreateCareer);
 
                                     // EnterCareer on an empty slot should still materialize a usable career.
                                     if (!slot.IsOccupied && !isCreateCareer)
@@ -2239,18 +2309,16 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         slot.PendingPersistenceCreation = false;
                                     }
 
-                                    _userStore.UpsertCareer(slot);
+                                    _userStore.UpsertCareer(identityHash, slot);
 
                                     // Track last selected slot so HTTP PlayerActivity updates can attribute character name.
-                                    _userStore.SetLastCareerIndex(careerIndex);
+                                    _userStore.SetLastCareerIndex(identityHash, careerIndex);
                                 }
 
                                 var characterName = slot != null && !IsNullOrWhiteSpace(slot.CharacterName)
                                     ? slot.CharacterName
                                     : (isCreateCareer ? "NewRunner" : "OfflineRunner");
 
-                                activeIdentityHash = identityHash;
-                                activeIdentityGuid = identityGuid;
                                 activeCareerIndex = careerIndex;
                                 activeCharacterName = characterName;
 
@@ -2281,7 +2349,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 var accountWelcomeCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 2, 14, accountWelcomePayload), serverMsgNoBase + 4);
                                 SendRawFrame(stream, peer, PrefixLength(accountWelcomeCore), "sent AccountCommunicationObject Welcome after EnterCareer");
 
-                                var updatePayload = BuildUtf16StringPayload(BuildCareerSummaryJson(_userStore != null ? _userStore.GetCareers() : null));
+                                var updatePayload = BuildUtf16StringPayload(BuildCareerSummaryJson(_userStore != null ? _userStore.GetCareers(identityHash) : null));
                                 var updateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 2, 16, updatePayload), serverMsgNoBase + 5);
                                 SendRawFrame(stream, peer, PrefixLength(updateCore), "sent AccountCommunicationObject UpdateCareerSummaries after EnterCareer");
 
@@ -2362,9 +2430,14 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 // Minimal behavior: acknowledge by re-sending current career summaries.
                                 // This keeps the client UI in sync without needing a full career-state machine.
                                 var msgNoBase = direct.Value.MsgNo + 20;
-                                var updatePayload = BuildUtf16StringPayload(BuildCareerSummaryJson(_userStore != null ? _userStore.GetCareers() : null));
+                                var updatePayload = BuildUtf16StringPayload(BuildCareerSummaryJson(_userStore != null && !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetCareers(activeIdentityHash) : null));
                                 var updateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 2, 16, updatePayload), msgNoBase + 1);
                                 SendRawFrame(stream, peer, PrefixLength(updateCore), "sent AccountCommunicationObject UpdateCareerSummaries after LeaveCurrentCareer");
+
+                                // The client can leave one career and then enter another without reconnecting.
+                                // If we keep sentEnterCareerUpdate=true, we will ignore the next career bootstrap
+                                // request (field 10/11) and the UI will hang on the loading screen.
+                                sentEnterCareerUpdate = false;
                             }
 
                             if (isDeactivateCareer)
@@ -2380,7 +2453,10 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                 if (_userStore != null)
                                 {
-                                    _userStore.DeactivateCareerSlot(slotIndex, DefaultHubId);
+                                    if (!IsNullOrWhiteSpace(activeIdentityHash))
+                                    {
+                                        _userStore.DeactivateCareerSlot(activeIdentityHash, slotIndex, DefaultHubId);
+                                    }
                                 }
 
                                 if (activeCareerIndex == slotIndex)
@@ -2390,7 +2466,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 }
 
                                 var msgNoBase = direct.Value.MsgNo + 30;
-                                var careers = _userStore != null ? _userStore.GetCareers() : null;
+                                var careers = _userStore != null && !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetCareers(activeIdentityHash) : null;
                                 var summaryJson = BuildCareerSummaryJson(careers);
 
                                 // IMPORTANT: CareerSelectionViewModel cancels the wait dialog only on CareerDeactivated.
@@ -2429,7 +2505,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     CareerSlot slot = null;
                                     if (_userStore != null)
                                     {
-                                        slot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                        if (!IsNullOrWhiteSpace(activeIdentityHash))
+                                        {
+                                            slot = _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false);
+                                        }
                                     }
 
                                     var zippedCareerInfo = (slot != null)
@@ -2571,10 +2650,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     var slotIndex = activeCareerIndex;
                                     if (slotIndex < 0)
                                     {
-                                        slotIndex = _userStore.GetLastCareerIndex();
+                                        slotIndex = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetLastCareerIndex(activeIdentityHash) : 0;
                                     }
 
-                                    var slot = _userStore.GetOrCreateCareer(slotIndex, false);
+                                    var slot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, slotIndex, false) : null;
                                     if (slot != null)
                                     {
                                         if (slot.SkillTreeDefinitions == null)
@@ -2648,7 +2727,7 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                         if (changed)
                                         {
-                                            try { _userStore.UpsertCareer(slot); } catch { }
+                                            try { _userStore.UpsertCareer(activeIdentityHash, slot); } catch { }
                                         }
 
                                         _logger.Log(new
@@ -2692,10 +2771,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     var slotIndex = activeCareerIndex;
                                     if (slotIndex < 0)
                                     {
-                                        slotIndex = _userStore.GetLastCareerIndex();
+                                        slotIndex = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetLastCareerIndex(activeIdentityHash) : 0;
                                     }
 
-                                    var slot = _userStore.GetOrCreateCareer(slotIndex, false);
+                                    var slot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, slotIndex, false) : null;
                                     if (slot != null)
                                     {
                                         if (slot.ItemPossessions == null)
@@ -2812,7 +2891,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             slot.Nuyen = 0;
                                         }
 
-                                        try { _userStore.UpsertCareer(slot); } catch { }
+                                        try { _userStore.UpsertCareer(activeIdentityHash, slot); } catch { }
 
                                         _logger.Log(new
                                         {
@@ -2908,10 +2987,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     var slotIndex = activeCareerIndex;
                                     if (slotIndex < 0)
                                     {
-                                        slotIndex = _userStore.GetLastCareerIndex();
+                                        slotIndex = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetLastCareerIndex(activeIdentityHash) : 0;
                                     }
 
-                                    var slot = _userStore.GetOrCreateCareer(slotIndex, false);
+                                    var slot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, slotIndex, false) : null;
                                     if (slot != null)
                                     {
                                         var wasPendingPersistenceCreation = slot.PendingPersistenceCreation;
@@ -3269,7 +3348,10 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                             if (changed)
                                             {
-                                                _userStore.UpsertCareer(slot);
+                                                if (!IsNullOrWhiteSpace(activeIdentityHash))
+                                                {
+                                                    _userStore.UpsertCareer(activeIdentityHash, slot);
+                                                }
                                             }
 
                                             if (changed)
@@ -3303,7 +3385,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             cachedHubStatePayload = BuildMetaHubPushPayload(4, SerializeHubStateOrFallback(hubId, characterIdentifier, slot.CharacterName, slot));
 
                                             var msgNoBase = direct.Value.MsgNo + 2;
-                                            var summaryJson = BuildCareerSummaryJson(_userStore.GetCareers());
+                                            var summaryJson = BuildCareerSummaryJson(!IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetCareers(activeIdentityHash) : null);
                                             var updatePayload = BuildUtf16StringPayload(summaryJson);
                                             var updateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 2, 16, updatePayload), msgNoBase);
                                             SendRawFrame(stream, peer, PrefixLength(updateCore), "sent AccountCommunicationObject UpdateCareerSummaries after CharacterChangeCollection");
@@ -3566,10 +3648,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         var slotIndex = activeCareerIndex;
                                         if (slotIndex < 0)
                                         {
-                                            slotIndex = _userStore.GetLastCareerIndex();
+                                            slotIndex = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetLastCareerIndex(activeIdentityHash) : 0;
                                         }
 
-                                        var slot = _userStore.GetOrCreateCareer(slotIndex, false);
+                                        var slot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, slotIndex, false) : null;
                                         if (slot != null)
                                         {
                                             var changed = false;
@@ -3638,7 +3720,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 {
                                                     slot.PendingPersistenceCreation = false;
                                                 }
-                                                _userStore.UpsertCareer(slot);
+                                                if (!IsNullOrWhiteSpace(activeIdentityHash))
+                                                {
+                                                    _userStore.UpsertCareer(activeIdentityHash, slot);
+                                                }
 
                                                 if (!IsNullOrWhiteSpace(slot.CharacterName))
                                                 {
@@ -3654,7 +3739,7 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                                 // Nudge client UI lists.
                                                 var msgNoBase = direct.Value.MsgNo + 2;
-                                                var summaryJson = BuildCareerSummaryJson(_userStore.GetCareers());
+                                                var summaryJson = BuildCareerSummaryJson(!IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetCareers(activeIdentityHash) : null);
                                                 var updatePayload = BuildUtf16StringPayload(summaryJson);
                                                 var updateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 2, 16, updatePayload), msgNoBase);
                                                 SendRawFrame(stream, peer, PrefixLength(updateCore), "sent AccountCommunicationObject UpdateCareerSummaries after CharacterChangeCollection");
@@ -3724,7 +3809,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         {
                                             try
                                             {
-                                                var slot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                                var slot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
                                                 if (slot != null)
                                                 {
                                                     slotForStoryRewards = slot;
@@ -3756,7 +3841,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                     // Store canonical enum names; our snapshot generator parses these.
                                                     slot.MainCampaignMissionStates[missionName] = parsedTarget.ToString();
 
-                                                    _userStore.UpsertCareer(slot);
+                                                    _userStore.UpsertCareer(activeIdentityHash, slot);
                                                 }
                                             }
                                             catch
@@ -3975,7 +4060,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         {
                                             try
                                             {
-                                                var advanced = TryAdvanceMainCampaignIfEligible(slotForStoryRewards, peer, stream, "Main Campaign", outMsgNo, ref cachedHubStatePayload, cachedCreationInfoPayload, true);
+                                                var advanced = TryAdvanceMainCampaignIfEligible(activeIdentityHash, slotForStoryRewards, peer, stream, "Main Campaign", outMsgNo, ref cachedHubStatePayload, cachedCreationInfoPayload, true);
                                                 if (advanced)
                                                 {
                                                     outMsgNo = outMsgNo + 2;
@@ -4088,7 +4173,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     {
                                         try
                                         {
-                                            var slot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                            var slot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
                                             if (slot != null)
                                             {
                                                 if (slot.MainCampaignInteractedNpcs == null)
@@ -4098,7 +4183,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 if (!slot.MainCampaignInteractedNpcs.Contains(npcId))
                                                 {
                                                     slot.MainCampaignInteractedNpcs.Add(npcId);
-                                                    _userStore.UpsertCareer(slot);
+                                                    _userStore.UpsertCareer(activeIdentityHash, slot);
                                                 }
                                             }
                                         }
@@ -4204,7 +4289,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             {
                                                 try
                                                 {
-                                                    slotForWallet = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                                    slotForWallet = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
                                                 }
                                                 catch
                                                 {
@@ -4262,7 +4347,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     {
                                         try
                                         {
-                                            var activeSlot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                            var activeSlot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
                                             if (activeSlot != null)
                                             {
                                                 if (selectedHenchmen != null && selectedHenchmen.Length > 0)
@@ -4290,7 +4375,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         {
                                             try
                                             {
-                                                var slotForLoot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                                var slotForLoot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
                                                 if (slotForLoot != null)
                                                 {
                                                     chapterForLoot = slotForLoot.MainCampaignCurrentChapter;
@@ -4417,7 +4502,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     {
                                         try
                                         {
-                                            var progressSlot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                            var progressSlot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
                                             if (progressSlot != null)
                                             {
                                                 if (progressSlot.MainCampaignMissionStates == null)
@@ -4440,14 +4525,14 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 }
 
                                                 progressSlot.MainCampaignMissionStates[completedMapName] = postMissionState.ToString();
-                                                _userStore.UpsertCareer(progressSlot);
+                                                _userStore.UpsertCareer(activeIdentityHash, progressSlot);
 
                                                 // If this completes the chapter, advance now (retail server pushes ChapterChange).
                                                 // During mission shutdown we only want to advance state + refresh cached hub payload.
                                                 // Sending unsolicited hub instances here can arrive before Meta UI is recreated,
                                                 // then get dropped client-side and also get duplicate-suppressed when the client
                                                 // later requests the hub instance.
-                                                TryAdvanceMainCampaignIfEligible(progressSlot, peer, stream, "Main Campaign", responseMsgNoBase + 9, ref cachedHubStatePayload, cachedCreationInfoPayload, false);
+                                                TryAdvanceMainCampaignIfEligible(activeIdentityHash, progressSlot, peer, stream, "Main Campaign", responseMsgNoBase + 9, ref cachedHubStatePayload, cachedCreationInfoPayload, false);
                                             }
                                         }
                                         catch
@@ -4580,7 +4665,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     CareerSlot rewardSlot = null;
                                     if (_userStore != null)
                                     {
-                                        rewardSlot = _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                        rewardSlot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
 
                                         var appliedLootItems = 0;
                                         if (rewardSlot != null && lootItemChanges != null && lootItemChanges.Count > 0)
@@ -4655,7 +4740,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 }
                                             }
 
-                                            _userStore.UpsertCareer(rewardSlot);
+                                            if (!IsNullOrWhiteSpace(activeIdentityHash))
+                                            {
+                                                _userStore.UpsertCareer(activeIdentityHash, rewardSlot);
+                                            }
 
                                             _logger.Log(new
                                             {
@@ -4746,7 +4834,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     {
                                         try
                                         {
-                                            var slotForSnapshot = rewardSlot ?? _userStore.GetOrCreateCareer(activeCareerIndex, false);
+                                            var slotForSnapshot = rewardSlot ?? (!IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null);
                                             var zippedCareerInfo = slotForSnapshot != null
                                                 ? _careerInfoGenerator.GetZippedCareerInfo(activeIdentityGuid, activeCareerIndex, slotForSnapshot)
                                                 : _careerInfoGenerator.GetZippedCareerInfo(activeIdentityGuid, activeCareerIndex, activeCharacterName, false);
