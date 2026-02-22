@@ -101,6 +101,18 @@
   <ItemGroup>
     <Compile Include="Career\CareerInfoGenerator.cs" />
     <Compile Include="Career\MatchConfigurationGenerator.cs" />
+    <Compile Include="AILogic\AiDecision.cs" />
+    <Compile Include="AILogic\AiMovementScorer.cs" />
+    <Compile Include="AILogic\BasicValuationContext.cs" />
+    <Compile Include="AILogic\BasicValuationFactory.cs" />
+    <Compile Include="AILogic\ConfigDrivenAiDecisionEngine.cs" />
+    <Compile Include="AILogic\EntityComponentAiBehaviourConfigLookup.cs" />
+    <Compile Include="AILogic\IAgentTemplateAiConfigLookup.cs" />
+    <Compile Include="AILogic\IAiBehaviourConfigLookup.cs" />
+    <Compile Include="AILogic\IAiDecisionEngine.cs" />
+    <Compile Include="AILogic\NullAgentTemplateAiConfigLookup.cs" />
+    <Compile Include="AILogic\NullAiDecisionEngine.cs" />
+    <Compile Include="AILogic\SkillSelectionStrategyFactory.cs" />
     <Compile Include="Persistence\LocalUserStore.cs" />
     <Compile Include="Persistence\LocalUserStore.IO.cs" />
     <Compile Include="Persistence\ISessionIdentityMap.cs" />

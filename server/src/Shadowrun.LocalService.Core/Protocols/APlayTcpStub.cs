@@ -4398,7 +4398,8 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             seed2,
                                             seed3,
                                             storyLineForLoot,
-                                            chapterForLoot);
+                                            chapterForLoot,
+                                            _options != null && _options.EnableAiLogic);
                                     }
                                     catch (Exception ex)
                                     {
@@ -5017,32 +5018,54 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         // moved to an AI team, immediately skip AI turns here too.
                                         try
                                         {
-                                            var aiEnds = simulationSession.SkipAiTurnsIfNeeded();
-                                            if (aiEnds != null && aiEnds.Count > 0)
+                                            var aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                            if (aiActions != null && aiActions.Count > 0)
                                             {
-                                                var baseMsgNo = responseMsgNoBase + 700;
+                                                // Use sequential message numbers immediately after the echoed mission command.
+                                                // Some clients appear to ignore or de-dupe frames with large msgNo jumps.
+                                                var baseMsgNo = responseMsgNoBase + 3;
                                                 var idx = 0;
-                                                foreach (var aiEnd in aiEnds)
+                                                foreach (var aiAction in aiActions)
                                                 {
-                                                    var seed0 = aiEnd.Seeds.Seed0;
-                                                    var seed1 = aiEnd.Seeds.Seed1;
-                                                    var seed2 = aiEnd.Seeds.Seed2;
-                                                    var seed3 = aiEnd.Seeds.Seed3;
+                                                    if (aiAction.Kind == ServerSimulationSession.AiTurnActionKind.FollowPath)
+                                                    {
+                                                        var payload = Concat(
+                                                            BitConverter.GetBytes(aiAction.AgentId),
+                                                            BitConverter.GetBytes(aiAction.TargetX),
+                                                            BitConverter.GetBytes(aiAction.TargetY));
 
-                                                    var payload = Concat(
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(EndTeamTurnSkillId),
-                                                        BitConverter.GetBytes(aiEnd.AgentId),
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(seed0),
-                                                        BitConverter.GetBytes(seed1),
-                                                        BitConverter.GetBytes(seed2),
-                                                        BitConverter.GetBytes(seed3));
+                                                        var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 1, payload), baseMsgNo + (ulong)idx);
+                                                        SendRawFrame(stream, peer, PrefixLength(core), "sim: AI FollowPath (agentId=" + aiAction.AgentId + ", x=" + aiAction.TargetX + ", y=" + aiAction.TargetY + ")");
+                                                    }
+                                                    else
+                                                    {
+                                                        var seed0 = aiAction.Seeds.Seed0;
+                                                        var seed1 = aiAction.Seeds.Seed1;
+                                                        var seed2 = aiAction.Seeds.Seed2;
+                                                        var seed3 = aiAction.Seeds.Seed3;
 
-                                                    var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 2, payload), baseMsgNo + (ulong)idx);
-                                                    SendRawFrame(stream, peer, PrefixLength(core), "sim: auto-ended AI team turn (agentId=" + aiEnd.AgentId + ")");
+                                                        var payload = Concat(
+                                                            BitConverter.GetBytes(aiAction.WeaponIndex),
+                                                            BitConverter.GetBytes(aiAction.SkillIndex),
+                                                            BitConverter.GetBytes(aiAction.SkillId),
+                                                            BitConverter.GetBytes(aiAction.AgentId),
+                                                            BitConverter.GetBytes(aiAction.TargetX),
+                                                            BitConverter.GetBytes(aiAction.TargetY),
+                                                            BitConverter.GetBytes(seed0),
+                                                            BitConverter.GetBytes(seed1),
+                                                            BitConverter.GetBytes(seed2),
+                                                            BitConverter.GetBytes(seed3));
+
+                                                        var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 2, payload), baseMsgNo + (ulong)idx);
+                                                        if (aiAction.SkillId == EndTeamTurnSkillId)
+                                                        {
+                                                            SendRawFrame(stream, peer, PrefixLength(core), "sim: auto-ended AI team turn (agentId=" + aiAction.AgentId + ")");
+                                                        }
+                                                        else
+                                                        {
+                                                            SendRawFrame(stream, peer, PrefixLength(core), "sim: AI ActivateActiveSkill (agentId=" + aiAction.AgentId + ", skillId=" + aiAction.SkillId + ")");
+                                                        }
+                                                    }
                                                     idx++;
                                                 }
                                             }
@@ -5072,32 +5095,54 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         // If the authoritative simulation moved to an AI team, immediately skip AI turns.
                                         try
                                         {
-                                            var aiEnds = simulationSession.SkipAiTurnsIfNeeded();
-                                            if (aiEnds != null && aiEnds.Count > 0)
+                                            var aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                            if (aiActions != null && aiActions.Count > 0)
                                             {
-                                                var baseMsgNo = responseMsgNoBase + 700;
+                                                // Use sequential message numbers immediately after the echoed mission command.
+                                                // Some clients appear to ignore or de-dupe frames with large msgNo jumps.
+                                                var baseMsgNo = responseMsgNoBase + 3;
                                                 var idx = 0;
-                                                foreach (var aiEnd in aiEnds)
+                                                foreach (var aiAction in aiActions)
                                                 {
-                                                    var seed0 = aiEnd.Seeds.Seed0;
-                                                    var seed1 = aiEnd.Seeds.Seed1;
-                                                    var seed2 = aiEnd.Seeds.Seed2;
-                                                    var seed3 = aiEnd.Seeds.Seed3;
+                                                    if (aiAction.Kind == ServerSimulationSession.AiTurnActionKind.FollowPath)
+                                                    {
+                                                        var payload = Concat(
+                                                            BitConverter.GetBytes(aiAction.AgentId),
+                                                            BitConverter.GetBytes(aiAction.TargetX),
+                                                            BitConverter.GetBytes(aiAction.TargetY));
 
-                                                    var payload = Concat(
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(EndTeamTurnSkillId),
-                                                        BitConverter.GetBytes(aiEnd.AgentId),
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(0),
-                                                        BitConverter.GetBytes(seed0),
-                                                        BitConverter.GetBytes(seed1),
-                                                        BitConverter.GetBytes(seed2),
-                                                        BitConverter.GetBytes(seed3));
+                                                        var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 1, payload), baseMsgNo + (ulong)idx);
+                                                        SendRawFrame(stream, peer, PrefixLength(core), "sim: AI FollowPath (agentId=" + aiAction.AgentId + ", x=" + aiAction.TargetX + ", y=" + aiAction.TargetY + ")");
+                                                    }
+                                                    else
+                                                    {
+                                                        var seed0 = aiAction.Seeds.Seed0;
+                                                        var seed1 = aiAction.Seeds.Seed1;
+                                                        var seed2 = aiAction.Seeds.Seed2;
+                                                        var seed3 = aiAction.Seeds.Seed3;
 
-                                                    var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 2, payload), baseMsgNo + (ulong)idx);
-                                                    SendRawFrame(stream, peer, PrefixLength(core), "sim: auto-ended AI team turn (agentId=" + aiEnd.AgentId + ")");
+                                                        var payload = Concat(
+                                                            BitConverter.GetBytes(aiAction.WeaponIndex),
+                                                            BitConverter.GetBytes(aiAction.SkillIndex),
+                                                            BitConverter.GetBytes(aiAction.SkillId),
+                                                            BitConverter.GetBytes(aiAction.AgentId),
+                                                            BitConverter.GetBytes(aiAction.TargetX),
+                                                            BitConverter.GetBytes(aiAction.TargetY),
+                                                            BitConverter.GetBytes(seed0),
+                                                            BitConverter.GetBytes(seed1),
+                                                            BitConverter.GetBytes(seed2),
+                                                            BitConverter.GetBytes(seed3));
+
+                                                        var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 2, payload), baseMsgNo + (ulong)idx);
+                                                        if (aiAction.SkillId == EndTeamTurnSkillId)
+                                                        {
+                                                            SendRawFrame(stream, peer, PrefixLength(core), "sim: auto-ended AI team turn (agentId=" + aiAction.AgentId + ")");
+                                                        }
+                                                        else
+                                                        {
+                                                            SendRawFrame(stream, peer, PrefixLength(core), "sim: AI ActivateActiveSkill (agentId=" + aiAction.AgentId + ", skillId=" + aiAction.SkillId + ")");
+                                                        }
+                                                    }
                                                     idx++;
                                                 }
                                             }

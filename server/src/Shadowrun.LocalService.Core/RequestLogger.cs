@@ -10,12 +10,19 @@ public sealed class RequestLogger
 
     private readonly string _path;
     private readonly string _lowPath;
+    private readonly string _aiPath;
     private readonly object _writeLock = new object();
 
     public RequestLogger(string path, string lowPath)
+        : this(path, lowPath, null)
+    {
+    }
+
+    public RequestLogger(string path, string lowPath, string aiPath)
     {
         _path = path;
         _lowPath = IsNullOrWhiteSpace(lowPath) ? null : lowPath;
+        _aiPath = IsNullOrWhiteSpace(aiPath) ? null : aiPath;
         var parent = Path.GetDirectoryName(_path);
         if (!IsNullOrWhiteSpace(parent))
         {
@@ -30,6 +37,15 @@ public sealed class RequestLogger
                 Directory.CreateDirectory(lowParent);
             }
         }
+
+        if (_aiPath != null)
+        {
+            var aiParent = Path.GetDirectoryName(_aiPath);
+            if (!IsNullOrWhiteSpace(aiParent))
+            {
+                Directory.CreateDirectory(aiParent);
+            }
+        }
     }
 
     public void Reset()
@@ -40,6 +56,11 @@ public sealed class RequestLogger
             if (_lowPath != null)
             {
                 File.WriteAllText(_lowPath, string.Empty);
+            }
+
+            if (_aiPath != null)
+            {
+                File.WriteAllText(_aiPath, string.Empty);
             }
         }
     }
@@ -65,6 +86,21 @@ public sealed class RequestLogger
         lock (_writeLock)
         {
             File.AppendAllText(_lowPath, json + Environment.NewLine);
+        }
+    }
+
+    public void LogAi(object payload)
+    {
+        if (_aiPath == null)
+        {
+            Log(payload);
+            return;
+        }
+
+        var json = Json.Serialize(payload);
+        lock (_writeLock)
+        {
+            File.AppendAllText(_aiPath, json + Environment.NewLine);
         }
     }
 
