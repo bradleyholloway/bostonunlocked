@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Text;
 using PhotonProxy.ChatAndFriends.Client.DTOs;
 using PhotonProxy.Common.ServiceCommunication;
@@ -199,6 +200,20 @@ namespace Shadowrun.LocalService.Core.Protocols
                     state.AccountId = accountId;
                     state.LocalUser = CreateUser(accountId);
 
+                    try
+                    {
+                        var wasOnline = _chatAndFriends != null && _chatAndFriends.IsAccountOnline(accountId);
+                        _chatAndFriends.RegisterOrUpdatePeer(state.ConnectionId, accountId, state.Endpoint, state.Stream);
+                        var isOnline = _chatAndFriends != null && _chatAndFriends.IsAccountOnline(accountId);
+                        if (!wasOnline && isOnline)
+                        {
+                            NotifyFriendsPresenceChanged(accountId, true);
+                        }
+                    }
+                    catch
+                    {
+                    }
+
                     return new ConnectResponse { IdentityHash = accountId };
                 }
 
@@ -212,56 +227,237 @@ namespace Shadowrun.LocalService.Core.Protocols
                 {
                     var req = DeserializeMessage<JoinChannelRequest>(requestPayload);
                     state.LastChannelName = req != null ? req.ChannelName : state.LastChannelName;
+
+                    try
+                    {
+                        _chatAndFriends.JoinChannel(state.ConnectionId, req != null ? req.ChannelName : null);
+                    }
+                    catch
+                    {
+                    }
+
                     return new JoinChannelResponse { ChannelName = req != null ? req.ChannelName : null };
                 }
 
                 case "LeaveChannelRequest":
+                {
+                    var req = DeserializeMessage<LeaveChannelRequest>(requestPayload);
+                    try
+                    {
+                        _chatAndFriends.LeaveChannel(state.ConnectionId, req != null ? req.ChannelName : null);
+                    }
+                    catch
+                    {
+                    }
                     return new LeaveChannelResponse();
+                }
 
                 case "GetChannelParticipantsRequest":
                 {
-                    return new GetChannelParticipantsResponse
+                    var req = DeserializeMessage<GetChannelParticipantsRequest>(requestPayload);
+                    var channelName = req != null ? req.ChannelName : null;
+                    List<User> participants;
+                    try
                     {
-                        Participants = new List<User> { state.LocalUser ?? CreateUser(state.AccountId) }
-                    };
+                        participants = _chatAndFriends.GetChannelParticipants(channelName);
+                    }
+                    catch
+                    {
+                        participants = new List<User> { state.LocalUser ?? CreateUser(state.AccountId) };
+                    }
+
+                    return new GetChannelParticipantsResponse { Participants = participants };
                 }
 
                 case "SendMessageToChannelRequest":
+                {
+                    var req = DeserializeMessage<SendMessageToChannelRequest>(requestPayload);
+                    try
+                    {
+                        if (req != null)
+                        {
+                            _chatAndFriends.BroadcastTextMessage(req.ChannelName, state.AccountId, req.TextMessage);
+                        }
+                    }
+                    catch
+                    {
+                    }
                     return new SendMessageToChannelResponse { Success = true };
+                }
 
                 case "ListFriendsRequest":
-                    return new ListFriendsResponse { Friends = new List<User>() };
+                {
+                    var req = DeserializeMessage<ListFriendsRequest>(requestPayload);
+                    var accountId = req != null && req.AccountId != Guid.Empty ? req.AccountId : state.AccountId;
+                    var friends = new List<User>();
+                    try
+                    {
+                        var friendIds = _friendsStore.GetFriends(accountId);
+                        for (var i = 0; i < friendIds.Count; i++)
+                        {
+                            var friendId = friendIds[i];
+                            friends.Add(CreateUser(friendId, _chatAndFriends != null && _chatAndFriends.IsAccountOnline(friendId)));
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    return new ListFriendsResponse { Friends = friends };
+                }
+
+                case "AddFriendRequest":
+                {
+                    var req = DeserializeMessage<AddFriendRequest>(requestPayload);
+                    var friendId = req != null ? req.FriendAccountId : Guid.Empty;
+
+                    if (state.AccountId != Guid.Empty && friendId != Guid.Empty)
+                    {
+                        try
+                        {
+                            _friendsStore.AddFriendship(state.AccountId, friendId);
+                            _chatAndFriends.NotifySomeoneAddedYouAsFriend(state.AccountId, friendId);
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    return new AddFriendResponse { Friend = friendId != Guid.Empty ? CreateUser(friendId, _chatAndFriends != null && _chatAndFriends.IsAccountOnline(friendId)) : null };
+                }
+
+                case "RemoveFriendRequest":
+                {
+                    var req = DeserializeMessage<RemoveFriendRequest>(requestPayload);
+                    var friendId = req != null ? req.FriendAccountId : Guid.Empty;
+                    if (state.AccountId != Guid.Empty && friendId != Guid.Empty)
+                    {
+                        try
+                        {
+                            _friendsStore.RemoveFriendship(state.AccountId, friendId);
+                        }
+                        catch
+                        {
+                        }
+                    }
+                    return new RemoveFriendResponse();
+                }
 
                 case "PushInvitationsRequest":
+                {
+                    try
+                    {
+                        _chatAndFriends.PushInvitationsTo(state.AccountId);
+                    }
+                    catch
+                    {
+                    }
                     return new PushInvitationsResponse();
+                }
 
                 case "CreateGroupRequest":
                 {
                     var req = DeserializeMessage<CreateGroupRequest>(requestPayload);
-                    var group = EnsureGroup(state, req);
+                    Group group;
+                    try
+                    {
+                        group = _chatAndFriends.CreateGroup(state.AccountId, req != null ? req.GroupName : null, req != null ? req.Capacity : 4, req != null && req.IsPersistent);
+                    }
+                    catch
+                    {
+                        group = EnsureGroup(state, req);
+                    }
                     return new CreateGroupResponse { GroupData = group };
                 }
 
                 case "ListGroupsRequest":
                 {
-                    var group = state.Group;
-                    var groups = new List<Group>();
-                    if (group != null)
+                    try
                     {
-                        groups.Add(group);
+                        return new ListGroupsResponse { Groups = _chatAndFriends.ListGroupsFor(state.AccountId) };
                     }
-                    return new ListGroupsResponse { Groups = groups };
+                    catch
+                    {
+                        var group = state.Group;
+                        var groups = new List<Group>();
+                        if (group != null)
+                        {
+                            groups.Add(group);
+                        }
+                        return new ListGroupsResponse { Groups = groups };
+                    }
                 }
 
                 case "ListGroupMembersRequest":
                 {
-                    var group = state.Group;
-                    var members = new List<User>();
-                    if (group != null && group.Members != null)
+                    var req = DeserializeMessage<ListGroupMembersRequest>(requestPayload);
+                    try
                     {
-                        members.AddRange(group.Members);
+                        return new ListGroupMembersResponse { Members = _chatAndFriends.ListGroupMembers(req != null ? req.GroupId : 0) };
                     }
-                    return new ListGroupMembersResponse { Members = members };
+                    catch
+                    {
+                        var group = state.Group;
+                        var members = new List<User>();
+                        if (group != null && group.Members != null)
+                        {
+                            members.AddRange(group.Members);
+                        }
+                        return new ListGroupMembersResponse { Members = members };
+                    }
+                }
+
+                case "InviteToGroupRequest":
+                {
+                    var req = DeserializeMessage<InviteToGroupRequest>(requestPayload);
+                    var code = "PlayerNotFound";
+                    try
+                    {
+                        code = _chatAndFriends.InviteToGroup(state.AccountId, req != null ? req.GroupId : 0, req != null ? req.InviteeId : Guid.Empty);
+                    }
+                    catch
+                    {
+                    }
+                    return new InviteToGroupResponse { ResultCode = code };
+                }
+
+                case "AcceptInvitationRequest":
+                {
+                    var req = DeserializeMessage<AcceptInvitationRequest>(requestPayload);
+                    try
+                    {
+                        return _chatAndFriends.AcceptInvitation(state.AccountId, req != null ? req.InvitationId : 0);
+                    }
+                    catch
+                    {
+                        return new AcceptInvitationResponse { ResultCode = "InvitationNotFound", GroupData = null };
+                    }
+                }
+
+                case "DeclineInvitationRequest":
+                {
+                    var req = DeserializeMessage<DeclineInvitationRequest>(requestPayload);
+                    try
+                    {
+                        return _chatAndFriends.DeclineInvitation(state.AccountId, req != null ? req.InvitationId : 0, req != null ? req.Reason : null);
+                    }
+                    catch
+                    {
+                        return new DeclineInvitationResponse { ResultCode = "Success" };
+                    }
+                }
+
+                case "RemoveGroupMemberRequest":
+                {
+                    var req = DeserializeMessage<RemoveGroupMemberRequest>(requestPayload);
+                    var result = "GroupNotExists";
+                    try
+                    {
+                        result = _chatAndFriends.RemoveGroupMember(state.AccountId, req != null ? req.GroupId : 0, req != null ? req.MemberId : Guid.Empty);
+                    }
+                    catch
+                    {
+                    }
+                    return new RemoveGroupMemberResponse { ResultCode = result };
                 }
 
                 case "SetGroupDataRequest":
@@ -355,10 +551,15 @@ namespace Shadowrun.LocalService.Core.Protocols
 
         private static User CreateUser(Guid accountId)
         {
+            return CreateUser(accountId, true);
+        }
+
+        private static User CreateUser(Guid accountId, bool isOnline)
+        {
             return new User
             {
                 AccountId = accountId,
-                IsOnline = true,
+                IsOnline = isOnline,
                 FriendshipOrigin = "offline",
             };
         }
@@ -480,6 +681,10 @@ namespace Shadowrun.LocalService.Core.Protocols
 
         private sealed class ConnectionState
         {
+            public Guid ConnectionId;
+            public string Endpoint;
+            public NetworkStream Stream;
+
             public Guid AccountId;
             public User LocalUser;
             public string LastChannelName;

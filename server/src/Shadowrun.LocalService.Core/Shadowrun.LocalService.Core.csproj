@@ -115,6 +115,7 @@
     <Compile Include="AILogic\SkillSelectionStrategyFactory.cs" />
     <Compile Include="Persistence\LocalUserStore.cs" />
     <Compile Include="Persistence\LocalUserStore.IO.cs" />
+    <Compile Include="Persistence\FriendsStore.cs" />
     <Compile Include="Persistence\ISessionIdentityMap.cs" />
     <Compile Include="Persistence\ExpiringSessionIdentityMap.cs" />
     <Compile Include="Http\HttpStubServer.cs" />
@@ -123,6 +124,7 @@
     <Compile Include="Protocols\APlayTcpStub.cs" />
     <Compile Include="Protocols\APlayTcpStub.StaticData.cs" />
     <Compile Include="Protocols\PhotonProxyTcpStub.cs" />
+    <Compile Include="Protocols\PhotonProxyTcpStub.ChatAndFriendsState.cs" />
     <Compile Include="Protocols\PhotonProxyTcpStub.Operations.cs" />
     <Compile Include="RequestLogger.cs" />
     <Compile Include="Simulation\LocalMissionLootController.cs" />
