@@ -24,7 +24,9 @@ namespace Shadowrun.LocalService.Host
 			{
 				// Ignore.
 			}
-			var logger = new RequestLogger(options.RequestLogPath, options.RequestLowLogPath, options.AiLogPath);
+			var logger = options.DisableFileLogs
+				? new RequestLogger(null, null, null)
+				: new RequestLogger(options.RequestLogPath, options.RequestLowLogPath, options.AiLogPath);
 			logger.Reset();
 			logger.Log(new
 			{
@@ -40,9 +42,18 @@ namespace Shadowrun.LocalService.Host
 			Console.WriteLine("[localservice-cs] listening on http://{0}:{1}", options.Host, options.Port);
 			Console.WriteLine("[localservice-cs] APlay TCP stub on {0}:{1}", options.Host, options.APlayPort);
 			Console.WriteLine("[localservice-cs] PhotonProxy TCP stub on {0}:{1}", options.Host, options.PhotonPort);
-			Console.WriteLine("[localservice-cs] request log: {0}", options.RequestLogPath);
-			Console.WriteLine("[localservice-cs] request log (low): {0}", options.RequestLowLogPath);
-			Console.WriteLine("[localservice-cs] request log (ai): {0}", options.AiLogPath);
+			if (options.DisableFileLogs)
+			{
+				Console.WriteLine("[localservice-cs] request log: (disabled)");
+				Console.WriteLine("[localservice-cs] request log (low): (disabled)");
+				Console.WriteLine("[localservice-cs] request log (ai): (disabled)");
+			}
+			else
+			{
+				Console.WriteLine("[localservice-cs] request log: {0}", options.RequestLogPath);
+				Console.WriteLine("[localservice-cs] request log (low): {0}", options.RequestLowLogPath);
+				Console.WriteLine("[localservice-cs] request log (ai): {0}", options.AiLogPath);
+			}
 
 			var stopEvent = new ManualResetEvent(false);
 			Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs eventArgs)
@@ -190,10 +201,16 @@ namespace Shadowrun.LocalService.Host
 			var port = 80;
 			var aplayPort = 5055;
 			var photonPort = 4530;
+			var noFileLogs = false;
 
 			for (var i = 0; i < args.Length; i++)
 			{
 				var arg = args[i] ?? string.Empty;
+				if (string.Equals(arg, "--no-file-logs", StringComparison.OrdinalIgnoreCase))
+				{
+					noFileLogs = true;
+					continue;
+				}
 				if (string.Equals(arg, "--host", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
 				{
 					host = args[++i];
@@ -233,6 +250,7 @@ namespace Shadowrun.LocalService.Host
 			options.Port = port;
 			options.APlayPort = aplayPort;
 			options.PhotonPort = photonPort;
+			options.DisableFileLogs = noFileLogs;
 			return options;
 		}
 	}

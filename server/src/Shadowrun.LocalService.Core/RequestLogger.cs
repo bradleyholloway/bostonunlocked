@@ -11,6 +11,7 @@ public sealed class RequestLogger
     private readonly string _path;
     private readonly string _lowPath;
     private readonly string _aiPath;
+    private readonly bool _fileLoggingEnabled;
     private readonly object _writeLock = new object();
 
     public RequestLogger(string path, string lowPath)
@@ -20,9 +21,21 @@ public sealed class RequestLogger
 
     public RequestLogger(string path, string lowPath, string aiPath)
     {
+        if (IsNullOrWhiteSpace(path))
+        {
+            // Disabled: do not write logs to disk.
+            _path = null;
+            _lowPath = null;
+            _aiPath = null;
+            _fileLoggingEnabled = false;
+            return;
+        }
+
         _path = path;
         _lowPath = IsNullOrWhiteSpace(lowPath) ? null : lowPath;
         _aiPath = IsNullOrWhiteSpace(aiPath) ? null : aiPath;
+        _fileLoggingEnabled = true;
+
         var parent = Path.GetDirectoryName(_path);
         if (!IsNullOrWhiteSpace(parent))
         {
@@ -50,6 +63,11 @@ public sealed class RequestLogger
 
     public void Reset()
     {
+        if (!_fileLoggingEnabled)
+        {
+            return;
+        }
+
         lock (_writeLock)
         {
             File.WriteAllText(_path, string.Empty);
@@ -67,6 +85,11 @@ public sealed class RequestLogger
 
     public void Log(object payload)
     {
+        if (!_fileLoggingEnabled)
+        {
+            return;
+        }
+
         var json = Json.Serialize(payload);
         lock (_writeLock)
         {
@@ -76,6 +99,11 @@ public sealed class RequestLogger
 
     public void LogLow(object payload)
     {
+        if (!_fileLoggingEnabled)
+        {
+            return;
+        }
+
         if (_lowPath == null)
         {
             Log(payload);
@@ -91,6 +119,11 @@ public sealed class RequestLogger
 
     public void LogAi(object payload)
     {
+        if (!_fileLoggingEnabled)
+        {
+            return;
+        }
+
         if (_aiPath == null)
         {
             Log(payload);

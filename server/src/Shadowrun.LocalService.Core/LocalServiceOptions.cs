@@ -48,6 +48,11 @@ public sealed class LocalServiceOptions
     /// </summary>
     public bool EnableAiLogic { get; set; }
 
+    /// <summary>
+    /// When true, the host will not write request logs to files.
+    /// </summary>
+    public bool DisableFileLogs { get; set; }
+
     public string DataDir
     {
         get { return _dataDir; }

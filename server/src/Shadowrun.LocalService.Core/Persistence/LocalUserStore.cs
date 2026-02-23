@@ -761,9 +761,32 @@ namespace Shadowrun.LocalService.Core.Persistence
                     target.Index = index;
                 }
 
+                // Full wipe: this is the "clear slot" behavior from the client.
+                // Do not retain skills, inventory, wallets, or story progress when a career is deactivated.
+                target.Voiceset = string.Empty;
+                target.WantsBackgroundChange = false;
+                target.PrimaryWeaponItemId = string.Empty;
+                target.PrimaryWeaponInventoryKey = 0;
+                target.SecondaryWeaponItemId = string.Empty;
+                target.SecondaryWeaponInventoryKey = 1;
+                target.ArmorItemId = string.Empty;
+                target.ArmorInventoryKey = 2;
+                target.EquippedItems = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                target.ItemPossessions = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                target.SkillTreeDefinitions = new Dictionary<string, string[]>(StringComparer.Ordinal);
+                target.Karma = 0;
+                target.Nuyen = 0;
+                target.MainCampaignCurrentChapter = 0;
+                target.MainCampaignMissionStates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                target.MainCampaignInteractedNpcs = new List<string>();
+                target.Bodytype = 0UL;
+                target.SkinTextureIndex = 0;
+                target.BackgroundStory = 0UL;
+
                 target.IsOccupied = false;
                 target.CharacterName = string.Empty;
                 target.Portrait = string.Empty;
+                target.PortraitPath = string.Empty;
                 target.PendingPersistenceCreation = false;
                 target.HubId = IsNullOrWhiteSpace(hubId) ? "Act01_HUB_02" : hubId;
                 target.CharacterIdentifier = NormalizeGuidish(identity) + ":" + index.ToString();

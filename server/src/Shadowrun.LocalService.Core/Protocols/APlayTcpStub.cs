@@ -2663,6 +2663,9 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                         var changed = false;
                                         var appliedCount = 0;
+                                        var karmaBefore = slot.Karma;
+                                        var karmaCostApplied = 0;
+                                        var karmaCostMissing = 0;
 
                                         if (applyReset)
                                         {
@@ -2696,6 +2699,16 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                     slot.SkillTreeDefinitions[tree] = new string[] { skill };
                                                     changed = true;
                                                     appliedCount++;
+
+                                                    int cost;
+                                                    if (TryResolveSkillKarmaCost(skill, out cost) && cost > 0)
+                                                    {
+                                                        karmaCostApplied += cost;
+                                                    }
+                                                    else
+                                                    {
+                                                        karmaCostMissing++;
+                                                    }
                                                     continue;
                                                 }
 
@@ -2722,11 +2735,28 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 slot.SkillTreeDefinitions[tree] = updated;
                                                 changed = true;
                                                 appliedCount++;
+
+                                                int cost2;
+                                                if (TryResolveSkillKarmaCost(skill, out cost2) && cost2 > 0)
+                                                {
+                                                    karmaCostApplied += cost2;
+                                                }
+                                                else
+                                                {
+                                                    karmaCostMissing++;
+                                                }
                                             }
                                         }
 
                                         if (changed)
                                         {
+                                            // Deduct karma for new purchases (best-effort). Never go negative.
+                                            if (!applyReset && karmaCostApplied > 0)
+                                            {
+                                                var next = slot.Karma - karmaCostApplied;
+                                                slot.Karma = next >= 0 ? next : 0;
+                                            }
+
                                             try { _userStore.UpsertCareer(activeIdentityHash, slot); } catch { }
                                         }
 
@@ -2741,6 +2771,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             applied = appliedCount,
                                             persisted = changed,
                                             inferredSkillLevels = inferredSkillLevels,
+                                            karmaBefore = karmaBefore,
+                                            karmaCostApplied = karmaCostApplied,
+                                            karmaAfter = slot.Karma,
+                                            karmaCostMissing = karmaCostMissing,
                                         });
 
                                         // Notify the client so it commits the purchase into its runtime snapshot.
@@ -4492,13 +4526,64 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     // In our generated match configuration, the local human player is always ID=1.
                                     const ulong participantId = 1UL;
 
-                                    // Mark the just-finished mission completed so the client doesn't auto-start it again.
-                                    // (The prologue is a DirectStart mission and will otherwise immediately restart on hub load.)
+                                    // Distinguish leaving after a real mission end (Victory/Defeat flow) from leaving mid-mission.
+                                    // If the sim is still running, treat LeaveMission as an abort/fail: do not grant completion credit
+                                    // and do not apply Victory story rewards.
+                                    var leavingMidMission = false;
+                                    if (simulationSession != null)
+                                    {
+                                        try
+                                        {
+                                            leavingMidMission = simulationSession.IsMissionStarted && !simulationSession.IsMissionStopped;
+                                        }
+                                        catch
+                                        {
+                                            leavingMidMission = false;
+                                        }
+                                    }
+
+                                    // Determine outcome (Abort/Victory/Defeat). Victory/Defeat are only meaningful once the mission ended.
+                                    var missionOutcome = leavingMidMission ? "Abort" : "Victory";
+                                    if (!leavingMidMission && simulationSession != null)
+                                    {
+                                        try
+                                        {
+                                            string simOutcome;
+                                            if (simulationSession.TryGetMissionOutcomeForPlayer(participantId, out simOutcome) && !IsNullOrWhiteSpace(simOutcome))
+                                            {
+                                                missionOutcome = simOutcome;
+                                            }
+                                            else
+                                            {
+                                                // If the mission stopped without an outcome being tracked, treat it as a failure.
+                                                if (simulationSession.IsMissionStopped)
+                                                {
+                                                    missionOutcome = "Defeat";
+                                                }
+                                            }
+                                        }
+                                        catch
+                                        {
+                                            // keep default
+                                        }
+                                    }
+
+                                    var isVictory = string.Equals(missionOutcome, "Victory", StringComparison.OrdinalIgnoreCase);
+
+                                    // Determine the mission we are leaving.
                                     var completedMapName = !IsNullOrWhiteSpace(currentMissionMapName) ? currentMissionMapName : "1_010_Prologue";
                                     var wasAlreadyCompleted = completedStoryMissions.Contains(completedMapName);
-                                    completedStoryMissions.Add(completedMapName);
 
-                                    // Persist mission completion for this career so it survives restarts.
+                                    // Only mark completed if we are leaving after a real mission end.
+                                    // If leaving mid-mission, keep it replayable and do NOT give completion credit.
+                                    if (isVictory)
+                                    {
+                                        // Mark the just-finished mission completed so the client doesn't auto-start it again.
+                                        // (The prologue is a DirectStart mission and will otherwise immediately restart on hub load.)
+                                        completedStoryMissions.Add(completedMapName);
+                                    }
+
+                                    // Persist mission completion/abort for this career so it survives restarts.
                                     if (_userStore != null)
                                     {
                                         try
@@ -4511,29 +4596,40 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                     progressSlot.MainCampaignMissionStates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                                                 }
 
-                                                // Retail-like: after a mission finishes, it becomes ReadyToReceiveRewards.
-                                                // The player (in hub) then redeems rewards, which moves it to Completed.
-                                                //
-                                                // Special-case the prologue: if we leave it at ReadyToReceiveRewards,
-                                                // the client's MandatoryMissionStarter can still consider it mandatory
-                                                // and will try to immediately start it again during mission shutdown.
-                                                // Our server-side StartMissionCancelled response then surfaces as
-                                                // "missionController.ServerAbortedMission".
-                                                var postMissionState = StoryMissionstate.ReadyToReceiveRewards;
-                                                if (string.Equals(completedMapName, "1_010_Prologue", StringComparison.OrdinalIgnoreCase))
+                                                if (!isVictory)
                                                 {
-                                                    postMissionState = StoryMissionstate.Completed;
+                                                    // Abort/defeat: keep the mission replayable and do not advance.
+                                                    progressSlot.MainCampaignMissionStates[completedMapName] = StoryMissionstate.ReadyToPlay.ToString();
                                                 }
+                                                else
+                                                {
+                                                    // Retail-like: after a mission finishes, it becomes ReadyToReceiveRewards.
+                                                    // The player (in hub) then redeems rewards, which moves it to Completed.
+                                                    //
+                                                    // Special-case the prologue: if we leave it at ReadyToReceiveRewards,
+                                                    // the client's MandatoryMissionStarter can still consider it mandatory
+                                                    // and will try to immediately start it again during mission shutdown.
+                                                    // Our server-side StartMissionCancelled response then surfaces as
+                                                    // "missionController.ServerAbortedMission".
+                                                    var postMissionState = StoryMissionstate.ReadyToReceiveRewards;
+                                                    if (string.Equals(completedMapName, "1_010_Prologue", StringComparison.OrdinalIgnoreCase))
+                                                    {
+                                                        postMissionState = StoryMissionstate.Completed;
+                                                    }
 
-                                                progressSlot.MainCampaignMissionStates[completedMapName] = postMissionState.ToString();
+                                                    progressSlot.MainCampaignMissionStates[completedMapName] = postMissionState.ToString();
+                                                }
                                                 _userStore.UpsertCareer(activeIdentityHash, progressSlot);
 
-                                                // If this completes the chapter, advance now (retail server pushes ChapterChange).
-                                                // During mission shutdown we only want to advance state + refresh cached hub payload.
-                                                // Sending unsolicited hub instances here can arrive before Meta UI is recreated,
-                                                // then get dropped client-side and also get duplicate-suppressed when the client
-                                                // later requests the hub instance.
-                                                TryAdvanceMainCampaignIfEligible(activeIdentityHash, progressSlot, peer, stream, "Main Campaign", responseMsgNoBase + 9, ref cachedHubStatePayload, cachedCreationInfoPayload, false);
+                                                if (isVictory)
+                                                {
+                                                    // If this completes the chapter, advance now (retail server pushes ChapterChange).
+                                                    // During mission shutdown we only want to advance state + refresh cached hub payload.
+                                                    // Sending unsolicited hub instances here can arrive before Meta UI is recreated,
+                                                    // then get dropped client-side and also get duplicate-suppressed when the client
+                                                    // later requests the hub instance.
+                                                    TryAdvanceMainCampaignIfEligible(activeIdentityHash, progressSlot, peer, stream, "Main Campaign", responseMsgNoBase + 9, ref cachedHubStatePayload, cachedCreationInfoPayload, false);
+                                                }
                                             }
                                         }
                                         catch
@@ -4635,14 +4731,27 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         {
                                         }
                                     }
+
+                                    if (!isVictory)
+                                    {
+                                        _logger.Log(new
+                                        {
+                                            ts = RequestLogger.UtcNowIso(),
+                                            type = "mission-exit",
+                                            peer = peer,
+                                            mapName = completedMapName,
+                                            outcome = missionOutcome,
+                                            note = leavingMidMission ? "LeaveMission mid-mission; skipping completion credit/rewards" : "LeaveMission after mission end; non-victory outcome",
+                                        });
+                                    }
                                     
                                     int found;
-                                    if (TryResolveMissionCurrencyReward(completedMapName, "Victory", "Karma", out found) && found > 0)
+                                    if (!leavingMidMission && TryResolveMissionCurrencyReward(completedMapName, missionOutcome, "Karma", out found) && found > 0)
                                     {
                                         karmaReward = found;
                                     }
 
-                                    if (TryResolveMissionCurrencyReward(completedMapName, "Victory", "Nuyen", out found) && found > 0)
+                                    if (!leavingMidMission && TryResolveMissionCurrencyReward(completedMapName, missionOutcome, "Nuyen", out found) && found > 0)
                                     {
                                         nuyenReward = found;
                                     }
@@ -4752,6 +4861,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 type = "mission-reward",
                                                 peer = peer,
                                                 mapName = completedMapName,
+                                                outcome = missionOutcome,
                                                 karmaDelta = karmaReward,
                                                 karmaTotal = rewardSlot.Karma,
                                                 nuyenDelta = nuyenReward,

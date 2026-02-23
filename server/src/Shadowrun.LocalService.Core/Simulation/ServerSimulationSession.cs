@@ -116,6 +116,50 @@ namespace Shadowrun.LocalService.Core.Simulation
             }
         }
 
+        internal bool IsMissionStarted
+        {
+            get { return _simulation != null && _simulation.IsMissionStarted; }
+        }
+
+        internal bool IsMissionStopped
+        {
+            get { return _simulation != null && _simulation.IsMissionStopped; }
+        }
+
+        internal bool TryGetMissionOutcomeForPlayer(ulong playerId, out string outcome)
+        {
+            outcome = null;
+            try
+            {
+                if (_gameworld == null || _gameworld.MissionOutcomeTrackingSystem == null)
+                {
+                    return false;
+                }
+
+                var tracker = _gameworld.MissionOutcomeTrackingSystem;
+                if (!tracker.HasMissionEnded)
+                {
+                    return false;
+                }
+
+                var victors = tracker.GetVictoriousPlayers();
+                if (victors == null)
+                {
+                    return false;
+                }
+
+                // If the player is not listed as victorious, treat it as a defeat/failure.
+                var didWin = victors.Contains(playerId);
+                outcome = didWin ? "Victory" : "Defeat";
+                return true;
+            }
+            catch
+            {
+                outcome = null;
+                return false;
+            }
+        }
+
         public static ServerSimulationSession Create(
             RequestLogger logger,
             string peer,
