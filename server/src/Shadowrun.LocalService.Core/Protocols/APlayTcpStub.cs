@@ -32,6 +32,9 @@ namespace Shadowrun.LocalService.Core.Protocols
                 CoopGroupName = coopGroupName;
                 SyncRoot = new object();
                 CreatedUtc = DateTime.UtcNow;
+
+                LootSnapshot = null;
+                LootAppliedToParticipants = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
             }
 
             public readonly string CoopGroupName;
@@ -45,6 +48,12 @@ namespace Shadowrun.LocalService.Core.Protocols
             public uint Seed3;
             public string CompressedMatchConfiguration;
             public ServerSimulationSession Simulation;
+
+            // Coop loot is shared at the simulation level (one LocalMissionLootController), but rewards must be
+            // applied per-player. If the first client to leave drains the loot, other clients would miss it.
+            // Snapshot the drained loot once per coop run and apply to each participant (identity+career) once.
+            public Shadowrun.LocalService.Core.Simulation.LocalMissionLootController.LootGrant[] LootSnapshot;
+            public Dictionary<string, bool> LootAppliedToParticipants;
         }
 
         private const string DefaultHubId = "Act01_HUB_02";
@@ -2993,6 +3002,18 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             coopSession.Seed2 = seed2;
                                             coopSession.Seed3 = seed3;
                                             coopSession.CompressedMatchConfiguration = compressedMatchConfiguration;
+
+                                            // New run -> reset coop loot snapshot/tracking.
+                                            coopSession.LootSnapshot = null;
+                                            if (coopSession.LootAppliedToParticipants == null)
+                                            {
+                                                coopSession.LootAppliedToParticipants = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                                            }
+                                            else
+                                            {
+                                                coopSession.LootAppliedToParticipants.Clear();
+                                            }
+
                                             coopSession.Simulation = ServerSimulationSession.Create(
                                                 _logger,
                                                 peer,
@@ -5140,7 +5161,55 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     {
                                         try
                                         {
-                                            var grants = simulationSession.DrainPendingLoot();
+                                            Shadowrun.LocalService.Core.Simulation.LocalMissionLootController.LootGrant[] grants = null;
+                                            var coopLootAppliedAlready = false;
+
+                                            // Coop missions: drain once per shared sim, then apply snapshot to each participant once.
+                                            if (!IsNullOrWhiteSpace(currentCoopGroupName))
+                                            {
+                                                CoopMissionSessionState coopSession = null;
+                                                lock (_coopMissionLock)
+                                                {
+                                                    _coopMissionSessions.TryGetValue(currentCoopGroupName, out coopSession);
+                                                }
+
+                                                if (coopSession != null)
+                                                {
+                                                    lock (coopSession.SyncRoot)
+                                                    {
+                                                        if (coopSession.LootAppliedToParticipants == null)
+                                                        {
+                                                            coopSession.LootAppliedToParticipants = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                                                        }
+
+                                                        if (coopSession.LootSnapshot == null)
+                                                        {
+                                                            coopSession.LootSnapshot = simulationSession.DrainPendingLoot();
+                                                        }
+
+                                                        // Key by identity+career; two humans can be different indices.
+                                                        var participantKey = (activeIdentityHash ?? string.Empty) + ":" + activeCareerIndex.ToString(CultureInfo.InvariantCulture);
+                                                        bool already;
+                                                        if (coopSession.LootAppliedToParticipants.TryGetValue(participantKey, out already) && already)
+                                                        {
+                                                            coopLootAppliedAlready = true;
+                                                            grants = new Shadowrun.LocalService.Core.Simulation.LocalMissionLootController.LootGrant[0];
+                                                        }
+                                                        else
+                                                        {
+                                                            coopSession.LootAppliedToParticipants[participantKey] = true;
+                                                            grants = coopSession.LootSnapshot ?? new Shadowrun.LocalService.Core.Simulation.LocalMissionLootController.LootGrant[0];
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            if (grants == null)
+                                            {
+                                                // Single-player: each connection owns its sim; drain directly.
+                                                grants = simulationSession.DrainPendingLoot();
+                                            }
+
                                             if (grants != null && grants.Length > 0)
                                             {
                                                 var items = new List<string>();
@@ -5163,15 +5232,15 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                         items.Add(g.ItemId);
 
                                                         // Persist loot as actual inventory items; the client expects ItemChanges in GotMissionReward.
-                                                        // Quality/flavour are not surfaced by LootGrant, so default to 0/-1.
+                                                        // Preserve Quality/Flavour from the sim loot roll (used for augmented items).
                                                         if (g.Delta != 0)
                                                         {
                                                             try
                                                             {
                                                                 lootItemChanges.Add(new ItemChange(g.ItemId, g.Delta)
                                                                 {
-                                                                    Quality = 0,
-                                                                    Flavour = -1,
+                                                                    Quality = g.Quality,
+                                                                    Flavour = g.Flavour,
                                                                 });
                                                             }
                                                             catch
@@ -5205,6 +5274,8 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                     type = "mission-loot-drain",
                                                     peer = peer,
                                                     mapName = completedMapName,
+                                                    coopGroupName = currentCoopGroupName,
+                                                    coopAppliedAlready = coopLootAppliedAlready,
                                                     grants = grants.Length,
                                                     nuyenFromLoot = lootNuyenReward,
                                                     lootTables = lootTables,

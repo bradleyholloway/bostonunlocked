@@ -15,6 +15,12 @@ namespace Shadowrun.LocalService.Core.Protocols
     {
         private sealed class ChatAndFriendsState
         {
+            private struct PendingAccountEvent
+            {
+                public Guid AccountId;
+                public MessageEventParameters Event;
+            }
+
             private readonly PhotonProxyTcpStub _owner;
             private readonly object _lock = new object();
 
@@ -108,6 +114,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                     return;
                 }
 
+                List<PendingAccountEvent> pending = null;
                 lock (_lock)
                 {
                     Peer peer;
@@ -125,7 +132,11 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 if (accountWentOffline)
                                 {
                                     _connIdsByAccountId.Remove(peer.AccountId);
-                                    HandleAccountOffline_NoLock(peer.AccountId);
+                                    if (pending == null)
+                                    {
+                                        pending = new List<PendingAccountEvent>();
+                                    }
+                                    HandleAccountOffline_NoLock(peer.AccountId, pending);
                                 }
                             }
                         }
@@ -139,13 +150,31 @@ namespace Shadowrun.LocalService.Core.Protocols
                         }
                     }
                 }
+
+                if (pending != null && pending.Count > 0)
+                {
+                    for (var i = 0; i < pending.Count; i++)
+                    {
+                        var p = pending[i];
+                        if (p.AccountId == Guid.Empty || p.Event == null)
+                        {
+                            continue;
+                        }
+                        SendEventToAccount(p.AccountId, p.Event);
+                    }
+                }
             }
 
-            private void HandleAccountOffline_NoLock(Guid accountId)
+            private void HandleAccountOffline_NoLock(Guid accountId, List<PendingAccountEvent> pending)
             {
                 if (accountId == Guid.Empty)
                 {
                     return;
+                }
+
+                if (pending == null)
+                {
+                    pending = new List<PendingAccountEvent>();
                 }
 
                 // NOTE: caller holds _lock.
@@ -178,7 +207,28 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                 for (var i = 0; i < groupsToDisband.Count; i++)
                 {
-                    DisbandGroup_NoLock(groupsToDisband[i]);
+                    GroupRecord rec;
+                    if (_groupsById.TryGetValue(groupsToDisband[i], out rec) && rec != null && rec.Group != null)
+                    {
+                        var groupSnapshot = CloneGroup(rec);
+                        var notify = rec.MemberAccountIds != null ? rec.MemberAccountIds.ToArray() : new Guid[0];
+                        DisbandGroup_NoLock(groupsToDisband[i]);
+
+                        var evt = BuildGroupsListChangedEvent(groupSnapshot, 0);
+                        for (var n = 0; n < notify.Length; n++)
+                        {
+                            var m = notify[n];
+                            if (m == Guid.Empty)
+                            {
+                                continue;
+                            }
+                            pending.Add(new PendingAccountEvent { AccountId = m, Event = evt });
+                        }
+                    }
+                    else
+                    {
+                        DisbandGroup_NoLock(groupsToDisband[i]);
+                    }
                 }
 
                 for (var i = 0; i < groupsToRemoveFrom.Count; i++)
@@ -186,13 +236,93 @@ namespace Shadowrun.LocalService.Core.Protocols
                     GroupRecord rec;
                     if (_groupsById.TryGetValue(groupsToRemoveFrom[i], out rec) && rec != null && rec.Group != null)
                     {
+                        // Notify remaining members that this user left (disconnect/offline).
+                        var groupId = rec.Group.Id;
                         RemoveMemberFromGroup_NoLock(rec, accountId);
+
+                        var groupSnapshotAfter = CloneGroup(rec);
+                        var leftEvt = BuildGroupMemberLeftEvent(accountId, groupSnapshotAfter, "GroupManager.LeftGroup");
+                        var notify = rec.MemberAccountIds != null ? rec.MemberAccountIds.ToArray() : new Guid[0];
+                        for (var n = 0; n < notify.Length; n++)
+                        {
+                            var m = notify[n];
+                            if (m == Guid.Empty)
+                            {
+                                continue;
+                            }
+                            pending.Add(new PendingAccountEvent { AccountId = m, Event = leftEvt });
+                        }
+
                         if (rec.MemberAccountIds.Count == 0)
                         {
-                            DisbandGroup_NoLock(rec.Group.Id);
+                            // Group became empty; tell any still-online members to refresh groups list.
+                            DisbandGroup_NoLock(groupId);
                         }
                     }
                 }
+            }
+
+            private static Dictionary<string, object> BuildGroupDataObject(Group group)
+            {
+                if (group == null)
+                {
+                    return null;
+                }
+
+                return new Dictionary<string, object>
+                {
+                    { "Id", group.Id },
+                    { "GroupName", group.GroupName },
+                    { "ChannelName", group.ChannelName },
+                    { "IsPersistent", group.IsPersistent },
+                    { "Capacity", group.Capacity },
+                    { "Members", group.Members != null ? group.Members.Select(m => m.AccountId.ToString()).ToArray() : new string[0] },
+                };
+            }
+
+            private static MessageEventParameters BuildGroupMemberLeftEvent(Guid memberId, Group group, string reason)
+            {
+                var root = new Dictionary<string, object>();
+                root["$type"] = "Cliffhanger.ChatAndFriends.Client.Messaging.DTOs.GroupMemberLeftMessage, Cliffhanger.ChatAndFriends.Client";
+                root["PlayerWhoLeftGroup"] = memberId.ToString();
+                root["Group"] = BuildGroupDataObject(group);
+                root["Reason"] = string.IsNullOrEmpty(reason) ? "GroupManager.LeftGroup" : reason;
+
+                return new MessageEventParameters
+                {
+                    Type = "GroupMemberLeftMessage",
+                    Payload = Json.Serialize(root),
+                };
+            }
+
+            private static MessageEventParameters BuildGroupMemberKickedEvent(Guid kickedMemberId, Guid? kickerAccountId, Group group, string reason)
+            {
+                var root = new Dictionary<string, object>();
+                root["$type"] = "Cliffhanger.ChatAndFriends.Client.Messaging.DTOs.GroupMemberKickedMessage, Cliffhanger.ChatAndFriends.Client";
+                root["PlayerWhoWasKicked"] = kickedMemberId.ToString();
+                root["PlayerWhoKicked"] = kickerAccountId.HasValue ? kickerAccountId.Value.ToString() : null;
+                root["Group"] = BuildGroupDataObject(group);
+                root["Reason"] = string.IsNullOrEmpty(reason) ? "GroupManager.Kicked" : reason;
+
+                return new MessageEventParameters
+                {
+                    Type = "GroupMemberKickedMessage",
+                    Payload = Json.Serialize(root),
+                };
+            }
+
+            private static MessageEventParameters BuildGroupsListChangedEvent(Group group, int action)
+            {
+                var root = new Dictionary<string, object>();
+                root["$type"] = "Cliffhanger.ChatAndFriends.Client.Messaging.DTOs.GroupsListChangedMessage, Cliffhanger.ChatAndFriends.Client";
+                root["GroupData"] = BuildGroupDataObject(group);
+                root["Action"] = action;
+
+                return new MessageEventParameters
+                {
+                    Type = "GroupsListChangedMessage",
+                    Payload = Json.Serialize(root),
+                };
             }
 
             public void JoinChannel(Guid connectionId, string channelName)
@@ -1228,6 +1358,8 @@ namespace Shadowrun.LocalService.Core.Protocols
                     return "UserToKickIsNotGroupMember";
                 }
 
+                var pending = new List<PendingAccountEvent>();
+                string result;
                 lock (_lock)
                 {
                     GroupRecord rec;
@@ -1246,25 +1378,89 @@ namespace Shadowrun.LocalService.Core.Protocols
                         return "UserToKickIsNotGroupMember";
                     }
 
+                    var isSelfLeave = requesterAccountId == memberId;
                     var ownerLeft = rec.OwnerAccountId == memberId;
+                    var isPersistent = rec.Group.IsPersistent;
 
                     RemoveMemberFromGroup_NoLock(rec, memberId);
 
+                    // Snapshot group AFTER removal (used for filtering in client and for group caches).
+                    var groupAfter = CloneGroup(rec);
+                    var remainingMembers = rec.MemberAccountIds != null ? rec.MemberAccountIds.ToArray() : new Guid[0];
+
+                    if (isSelfLeave)
+                    {
+                        var leftEvt = BuildGroupMemberLeftEvent(memberId, groupAfter, "GroupManager.LeftGroup");
+                        // Notify remaining members.
+                        for (var i = 0; i < remainingMembers.Length; i++)
+                        {
+                            var a = remainingMembers[i];
+                            if (a != Guid.Empty)
+                            {
+                                pending.Add(new PendingAccountEvent { AccountId = a, Event = leftEvt });
+                            }
+                        }
+                        // Also notify the leaver (helps UI cleanup if the group object lingers briefly).
+                        pending.Add(new PendingAccountEvent { AccountId = memberId, Event = leftEvt });
+                    }
+                    else
+                    {
+                        var kickedEvt = BuildGroupMemberKickedEvent(memberId, requesterAccountId, groupAfter, "GroupManager.Kicked");
+                        // Notify remaining members.
+                        for (var i = 0; i < remainingMembers.Length; i++)
+                        {
+                            var a = remainingMembers[i];
+                            if (a != Guid.Empty)
+                            {
+                                pending.Add(new PendingAccountEvent { AccountId = a, Event = kickedEvt });
+                            }
+                        }
+                        // Notify the kicked member too (Session listens for "I was kicked").
+                        pending.Add(new PendingAccountEvent { AccountId = memberId, Event = kickedEvt });
+                    }
+
                     // Non-persistent groups are treated as party instances; when the owner leaves, the group is closed.
-                    if (ownerLeft && !rec.Group.IsPersistent)
+                    if (ownerLeft && !isPersistent)
                     {
                         DisbandGroup_NoLock(groupId);
-                        return "Ok";
-                    }
 
-                    // Disband empty groups to avoid stale invitations being accepted later.
-                    if (rec.MemberAccountIds.Count == 0)
+                        var deletedEvt = BuildGroupsListChangedEvent(groupAfter, 0);
+                        for (var i = 0; i < remainingMembers.Length; i++)
+                        {
+                            var a = remainingMembers[i];
+                            if (a != Guid.Empty)
+                            {
+                                pending.Add(new PendingAccountEvent { AccountId = a, Event = deletedEvt });
+                            }
+                        }
+                        pending.Add(new PendingAccountEvent { AccountId = memberId, Event = deletedEvt });
+
+                        result = "Ok";
+                    }
+                    else
                     {
-                        DisbandGroup_NoLock(groupId);
+                        // Disband empty groups to avoid stale invitations being accepted later.
+                        if (rec.MemberAccountIds.Count == 0)
+                        {
+                            DisbandGroup_NoLock(groupId);
+                            var deletedEvt = BuildGroupsListChangedEvent(groupAfter, 0);
+                            pending.Add(new PendingAccountEvent { AccountId = memberId, Event = deletedEvt });
+                        }
+                        result = "Ok";
                     }
-
-                    return "Ok";
                 }
+
+                for (var i = 0; i < pending.Count; i++)
+                {
+                    var p = pending[i];
+                    if (p.AccountId == Guid.Empty || p.Event == null)
+                    {
+                        continue;
+                    }
+                    SendEventToAccount(p.AccountId, p.Event);
+                }
+
+                return result;
             }
 
             private void RemoveMemberFromGroup_NoLock(GroupRecord rec, Guid memberId)

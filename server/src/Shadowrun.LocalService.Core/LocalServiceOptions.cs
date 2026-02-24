@@ -64,12 +64,15 @@ public sealed class LocalServiceOptions
         get
         {
             // If the host is started from the repo's 'localservice' folder, don't duplicate it.
-            // Expected structure for localservice root: contains 'config' and 'logs' directories.
+            // Expected structure for localservice root: contains 'config' and 'static-data' directories.
             try
             {
                 var configDir = Path.Combine(WorkspaceRoot, "config");
-                var logsDir = Path.Combine(WorkspaceRoot, "logs");
-                if (Directory.Exists(configDir) && Directory.Exists(logsDir))
+                var staticDataDir = Path.Combine(WorkspaceRoot, "static-data");
+
+                // In the repo layout we often run from ./server which has config/ and static-data/,
+                // while logs/ live alongside the built executable.
+                if (Directory.Exists(configDir) && Directory.Exists(staticDataDir))
                 {
                     return WorkspaceRoot;
                 }
