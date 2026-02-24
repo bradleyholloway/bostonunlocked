@@ -51,6 +51,11 @@
       <SpecificVersion>False</SpecificVersion>
       <Private>True</Private>
     </Reference>
+    <Reference Include="Cliffhanger.ChatAndFriends.Interfaces">
+      <HintPath>..\Dependencies\Cliffhanger.ChatAndFriends.Interfaces.dll</HintPath>
+      <SpecificVersion>False</SpecificVersion>
+      <Private>True</Private>
+    </Reference>
     <Reference Include="Cliffhanger.SRO.ServerClientCommons">
       <HintPath>..\Dependencies\Cliffhanger.SRO.ServerClientCommons.dll</HintPath>
       <SpecificVersion>False</SpecificVersion>
@@ -123,6 +128,7 @@
     <Compile Include="LocalServiceOptions.cs" />
     <Compile Include="Protocols\APlayTcpStub.cs" />
     <Compile Include="Protocols\APlayTcpStub.StaticData.cs" />
+    <Compile Include="Protocols\CoopGroupHostRegistry.cs" />
     <Compile Include="Protocols\PhotonProxyTcpStub.cs" />
     <Compile Include="Protocols\PhotonProxyTcpStub.ChatAndFriendsState.cs" />
     <Compile Include="Protocols\PhotonProxyTcpStub.Operations.cs" />

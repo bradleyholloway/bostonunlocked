@@ -465,7 +465,14 @@ namespace Shadowrun.LocalService.Core.Protocols
                     var req = DeserializeMessage<SetGroupDataRequest>(requestPayload);
                     if (req != null && req.Data != null && !string.IsNullOrEmpty(req.Data.Key))
                     {
-                        state.GroupData[req.Data.Key] = req.Data.Value;
+                        if (_chatAndFriends != null && req.GroupId > 0)
+                        {
+                            _chatAndFriends.SetGroupData(state.AccountId, req.GroupId, req.Data.Key, req.Data.Value);
+                        }
+                        else
+                        {
+                            state.GroupData[req.Data.Key] = req.Data.Value;
+                        }
                     }
                     return new SetGroupDataResponse();
                 }
@@ -475,29 +482,63 @@ namespace Shadowrun.LocalService.Core.Protocols
                     var req = DeserializeMessage<DeleteGroupDataRequest>(requestPayload);
                     if (req != null && !string.IsNullOrEmpty(req.Datakey))
                     {
-                        state.GroupData.Remove(req.Datakey);
+                        if (_chatAndFriends != null && req.GroupId > 0)
+                        {
+                            _chatAndFriends.DeleteGroupData(state.AccountId, req.GroupId, req.Datakey);
+                        }
+                        else
+                        {
+                            state.GroupData.Remove(req.Datakey);
+                        }
                     }
                     return new DeleteGroupDataResponse();
                 }
 
                 case "GetGroupDataRequest":
                 {
+                    var req = DeserializeMessage<GetGroupDataRequest>(requestPayload);
                     var entries = new List<GroupDataEntry>();
-                    foreach (var kvp in state.GroupData)
+                    try
                     {
-                        entries.Add(new GroupDataEntry { Key = kvp.Key, Value = kvp.Value });
+                        if (_chatAndFriends != null && req != null && req.GroupId > 0)
+                        {
+                            var snapshot = _chatAndFriends.GetGroupDataSnapshot(req.GroupId);
+                            foreach (var kvp in snapshot)
+                            {
+                                entries.Add(new GroupDataEntry { Key = kvp.Key, Value = kvp.Value });
+                            }
+                        }
+                        else
+                        {
+                            foreach (var kvp in state.GroupData)
+                            {
+                                entries.Add(new GroupDataEntry { Key = kvp.Key, Value = kvp.Value });
+                            }
+                        }
+                    }
+                    catch
+                    {
                     }
                     return new GetGroupDataResponse { GroupData = entries };
                 }
 
                 case "BroadcastToGroupRequest":
                 {
-                    // For offline/solo we don't need to echo events back to the client yet; the UI updates its own local state.
-                    // We still accept the broadcast and cache it under a synthetic key for debugging.
                     var req = DeserializeMessage<BroadcastToGroupRequest>(requestPayload);
                     if (req != null && !string.IsNullOrEmpty(req.Data))
                     {
                         state.LastGroupBroadcast = req.Data;
+
+                        try
+                        {
+                            if (_chatAndFriends != null && req.GroupId > 0)
+                            {
+                                _chatAndFriends.BroadcastToGroup(state.AccountId, req.GroupId, req.Data);
+                            }
+                        }
+                        catch
+                        {
+                        }
                     }
                     return new BroadcastToGroupResponse();
                 }

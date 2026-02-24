@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Web.Script.Serialization;
+using Cliffhanger.ChatAndFriends.Interfaces.DTOs;
 using PhotonProxy.ChatAndFriends.Client.DTOs;
 using PhotonProxy.Common.ServiceCommunication;
 
@@ -49,6 +50,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                 public Group Group;
                 public Guid OwnerAccountId;
                 public readonly HashSet<Guid> MemberAccountIds = new HashSet<Guid>();
+                public readonly Dictionary<string, string> GroupData = new Dictionary<string, string>(StringComparer.Ordinal);
             }
 
             private sealed class InvitationRecord
@@ -313,7 +315,15 @@ namespace Shadowrun.LocalService.Core.Protocols
                     ServerTimestamp = DateTime.UtcNow,
                 };
 
-                BroadcastToChannel(channelName, payload, senderAccountId);
+                // Normal channel behavior (requires JoinChannelRequest).
+                var hadTargets = BroadcastToChannelIfAny(channelName, payload, senderAccountId);
+
+                // Party chat uses the group's ChannelName ("Group_<id>") but clients do not always explicitly join.
+                // Treat group membership as implicit channel membership.
+                if (!hadTargets && channelName.StartsWith("Group_", StringComparison.OrdinalIgnoreCase))
+                {
+                    BroadcastToGroupChannelIfAny(channelName, payload, senderAccountId);
+                }
             }
 
             private void BroadcastChannelParticipantChanged(string channelName, Guid participant, bool added)
@@ -365,6 +375,80 @@ namespace Shadowrun.LocalService.Core.Protocols
                 for (var i = 0; i < targets.Count; i++)
                 {
                     SendEventToPeer(targets[i], payload);
+                }
+            }
+
+            private bool BroadcastToChannelIfAny(string channelName, ISerializableMessage payload, Guid excludeAccountId)
+            {
+                List<Peer> targets;
+                lock (_lock)
+                {
+                    HashSet<Guid> members;
+                    if (!_channelMembers.TryGetValue(channelName, out members) || members == null || members.Count == 0)
+                    {
+                        return false;
+                    }
+
+                    targets = new List<Peer>(members.Count);
+                    foreach (var connId in members)
+                    {
+                        Peer peer;
+                        if (!_peersByConnId.TryGetValue(connId, out peer) || peer == null)
+                        {
+                            continue;
+                        }
+
+                        if (excludeAccountId != Guid.Empty && peer.AccountId == excludeAccountId)
+                        {
+                            continue;
+                        }
+
+                        targets.Add(peer);
+                    }
+                }
+
+                for (var i = 0; i < targets.Count; i++)
+                {
+                    SendEventToPeer(targets[i], payload);
+                }
+
+                return targets.Count > 0;
+            }
+
+            private void BroadcastToGroupChannelIfAny(string groupChannelName, ISerializableMessage payload, Guid excludeAccountId)
+            {
+                List<Guid> memberAccounts;
+                lock (_lock)
+                {
+                    memberAccounts = new List<Guid>();
+                    foreach (var rec in _groupsById.Values)
+                    {
+                        if (rec == null || rec.Group == null)
+                        {
+                            continue;
+                        }
+                        if (!string.Equals(rec.Group.ChannelName, groupChannelName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+                        memberAccounts.AddRange(rec.MemberAccountIds);
+                        break;
+                    }
+                }
+
+                if (memberAccounts.Count == 0)
+                {
+                    return;
+                }
+
+                for (var i = 0; i < memberAccounts.Count; i++)
+                {
+                    var accountId = memberAccounts[i];
+                    if (accountId == Guid.Empty || (excludeAccountId != Guid.Empty && accountId == excludeAccountId))
+                    {
+                        continue;
+                    }
+                    SendEventToAccount(accountId, payload);
                 }
             }
 
@@ -482,8 +566,317 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                     var rec = new GroupRecord { Group = group, OwnerAccountId = creatorAccountId };
                     rec.MemberAccountIds.Add(creatorAccountId);
+                    rec.GroupData["Leader"] = creatorAccountId.ToString();
                     _groupsById[id] = rec;
+
+                    if (!string.IsNullOrEmpty(groupName) && groupName.StartsWith("CoopGroup", StringComparison.OrdinalIgnoreCase))
+                    {
+                        CoopGroupHostRegistry.SetLeader(groupName, creatorAccountId);
+                    }
                     return group;
+                }
+            }
+
+            public Dictionary<string, string> GetGroupDataSnapshot(int groupId)
+            {
+                if (groupId <= 0)
+                {
+                    return new Dictionary<string, string>(StringComparer.Ordinal);
+                }
+
+                lock (_lock)
+                {
+                    GroupRecord rec;
+                    if (!_groupsById.TryGetValue(groupId, out rec) || rec == null)
+                    {
+                        return new Dictionary<string, string>(StringComparer.Ordinal);
+                    }
+
+                    return new Dictionary<string, string>(rec.GroupData, StringComparer.Ordinal);
+                }
+            }
+
+            public void SetGroupData(Guid senderAccountId, int groupId, string key, string value)
+            {
+                if (senderAccountId == Guid.Empty || groupId <= 0 || string.IsNullOrEmpty(key))
+                {
+                    return;
+                }
+
+                GroupRecord rec;
+                Group group;
+                List<Guid> notifyAccounts;
+                GroupDataChangedAction action;
+
+                lock (_lock)
+                {
+                    if (!_groupsById.TryGetValue(groupId, out rec) || rec == null || rec.Group == null)
+                    {
+                        return;
+                    }
+                    if (!rec.MemberAccountIds.Contains(senderAccountId))
+                    {
+                        return;
+                    }
+
+                    action = rec.GroupData.ContainsKey(key) ? GroupDataChangedAction.Changed : GroupDataChangedAction.Added;
+                    rec.GroupData[key] = value;
+
+                    group = CloneGroup(rec);
+                    notifyAccounts = rec.MemberAccountIds.ToList();
+                }
+
+                PushGroupDataChangedMessage(senderAccountId, group, action, key, value, notifyAccounts);
+
+                if (!string.IsNullOrEmpty(group.GroupName) && group.GroupName.StartsWith("CoopGroup", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.Equals(key, "Leader", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Guid leader;
+                        if (TryParseGuid(value, out leader))
+                        {
+                            CoopGroupHostRegistry.SetLeader(group.GroupName, leader);
+                        }
+                    }
+                }
+            }
+
+            public void DeleteGroupData(Guid senderAccountId, int groupId, string key)
+            {
+                if (senderAccountId == Guid.Empty || groupId <= 0 || string.IsNullOrEmpty(key))
+                {
+                    return;
+                }
+
+                GroupRecord rec;
+                Group group;
+                List<Guid> notifyAccounts;
+
+                lock (_lock)
+                {
+                    if (!_groupsById.TryGetValue(groupId, out rec) || rec == null || rec.Group == null)
+                    {
+                        return;
+                    }
+                    if (!rec.MemberAccountIds.Contains(senderAccountId))
+                    {
+                        return;
+                    }
+
+                    rec.GroupData.Remove(key);
+                    group = CloneGroup(rec);
+                    notifyAccounts = rec.MemberAccountIds.ToList();
+                }
+
+                PushGroupDataChangedMessage(senderAccountId, group, GroupDataChangedAction.Deleted, key, null, notifyAccounts);
+            }
+
+            public void BroadcastToGroup(Guid senderAccountId, int groupId, string data)
+            {
+                if (senderAccountId == Guid.Empty || groupId <= 0 || string.IsNullOrEmpty(data))
+                {
+                    return;
+                }
+
+                Group group;
+                List<Guid> notifyAccounts;
+
+                string groupName = null;
+                string leaderValue = null;
+                var looksLikeHostReady = false;
+
+                lock (_lock)
+                {
+                    GroupRecord rec;
+                    if (!_groupsById.TryGetValue(groupId, out rec) || rec == null || rec.Group == null)
+                    {
+                        return;
+                    }
+                    if (!rec.MemberAccountIds.Contains(senderAccountId))
+                    {
+                        return;
+                    }
+
+                    group = CloneGroup(rec);
+                    groupName = rec.Group != null ? rec.Group.GroupName : null;
+                    notifyAccounts = rec.MemberAccountIds.ToList();
+                }
+
+                // Track coop group leader/host so APlay can assign NPC control consistently.
+                if (!string.IsNullOrEmpty(groupName) && groupName.StartsWith("CoopGroup", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Broadcast payload is JSON: {"TypeName":"SRO.Client.ChatAndFriends.GroupDataObject, SRO.Client","Key":"Leader","Data":"<guid>"}
+                    // Keep this parsing intentionally simple/robust.
+                    if (data.IndexOf("\"Key\"", StringComparison.OrdinalIgnoreCase) >= 0
+                        && data.IndexOf("Leader", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        leaderValue = TryExtractQuotedJsonValue(data, "Data");
+                    }
+                    if (data.IndexOf("HostAllMembersReady", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        looksLikeHostReady = true;
+                    }
+
+                    Guid leader;
+                    if (!string.IsNullOrEmpty(leaderValue) && TryParseGuid(leaderValue, out leader))
+                    {
+                        CoopGroupHostRegistry.SetLeader(groupName, leader);
+                    }
+                    else if (looksLikeHostReady)
+                    {
+                        // Fallback: treat sender as host if we don't have an explicit Leader value.
+                        CoopGroupHostRegistry.SetLeader(groupName, senderAccountId);
+                    }
+                }
+
+                PushBroadcastDataMessage(senderAccountId, group, data, notifyAccounts);
+            }
+
+            private static string TryExtractQuotedJsonValue(string json, string key)
+            {
+                if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+                {
+                    return null;
+                }
+
+                // Very small helper to find patterns like "Key":"Value".
+                // Not a full JSON parser; just enough for our known payloads.
+                var needle = "\"" + key + "\"";
+                var idx = json.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                {
+                    return null;
+                }
+
+                idx = json.IndexOf(':', idx);
+                if (idx < 0)
+                {
+                    return null;
+                }
+                idx++;
+                while (idx < json.Length && (json[idx] == ' ' || json[idx] == '\t' || json[idx] == '\r' || json[idx] == '\n'))
+                {
+                    idx++;
+                }
+
+                if (idx >= json.Length || json[idx] != '"')
+                {
+                    return null;
+                }
+
+                idx++;
+                var end = json.IndexOf('"', idx);
+                if (end < 0)
+                {
+                    return null;
+                }
+                return json.Substring(idx, end - idx);
+            }
+
+            private static bool TryParseGuid(string value, out Guid guid)
+            {
+                guid = Guid.Empty;
+                if (string.IsNullOrEmpty(value))
+                {
+                    return false;
+                }
+                try
+                {
+                    guid = new Guid(value.Trim());
+                    return guid != Guid.Empty;
+                }
+                catch
+                {
+                    guid = Guid.Empty;
+                    return false;
+                }
+            }
+
+            private void PushBroadcastDataMessage(Guid senderAccountId, Group group, string data, List<Guid> notifyAccounts)
+            {
+                if (senderAccountId == Guid.Empty || group == null || string.IsNullOrEmpty(data))
+                {
+                    return;
+                }
+
+                var root = new Dictionary<string, object>();
+                root["$type"] = "Cliffhanger.ChatAndFriends.Client.Messaging.DTOs.BroadcastDataMessage, Cliffhanger.ChatAndFriends.Client";
+                root["SenderId"] = senderAccountId.ToString();
+                root["Data"] = data;
+                root["TimeSent"] = DateTime.UtcNow.ToString("o");
+                root["Group"] = new Dictionary<string, object>
+                {
+                    { "Id", group.Id },
+                    { "GroupName", group.GroupName },
+                    { "ChannelName", group.ChannelName },
+                    { "IsPersistent", group.IsPersistent },
+                    { "Capacity", group.Capacity },
+                    { "Members", group.Members != null ? group.Members.Select(m => m.AccountId.ToString()).ToArray() : new string[0] },
+                };
+
+                var evt = new MessageEventParameters
+                {
+                    Type = "BroadcastDataMessage",
+                    Payload = Json.Serialize(root),
+                };
+
+                if (notifyAccounts == null)
+                {
+                    return;
+                }
+
+                for (var i = 0; i < notifyAccounts.Count; i++)
+                {
+                    var accountId = notifyAccounts[i];
+                    if (accountId == Guid.Empty || accountId == senderAccountId)
+                    {
+                        continue;
+                    }
+                    SendEventToAccount(accountId, evt);
+                }
+            }
+
+            private void PushGroupDataChangedMessage(Guid senderAccountId, Group group, GroupDataChangedAction action, string key, string value, List<Guid> notifyAccounts)
+            {
+                if (senderAccountId == Guid.Empty || group == null || string.IsNullOrEmpty(key))
+                {
+                    return;
+                }
+
+                var root = new Dictionary<string, object>();
+                root["$type"] = "Cliffhanger.ChatAndFriends.Client.Messaging.DTOs.GroupDataChangedMessage, Cliffhanger.ChatAndFriends.Client";
+                root["Action"] = (int)action;
+                root["Key"] = key;
+                root["Value"] = value;
+                root["Group"] = new Dictionary<string, object>
+                {
+                    { "Id", group.Id },
+                    { "GroupName", group.GroupName },
+                    { "ChannelName", group.ChannelName },
+                    { "IsPersistent", group.IsPersistent },
+                    { "Capacity", group.Capacity },
+                    { "Members", group.Members != null ? group.Members.Select(m => m.AccountId.ToString()).ToArray() : new string[0] },
+                };
+
+                var evt = new MessageEventParameters
+                {
+                    Type = "GroupDataChangedMessage",
+                    Payload = Json.Serialize(root),
+                };
+
+                if (notifyAccounts == null)
+                {
+                    return;
+                }
+
+                for (var i = 0; i < notifyAccounts.Count; i++)
+                {
+                    var accountId = notifyAccounts[i];
+                    if (accountId == Guid.Empty || accountId == senderAccountId)
+                    {
+                        continue;
+                    }
+                    SendEventToAccount(accountId, evt);
                 }
             }
 

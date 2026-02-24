@@ -25,9 +25,30 @@ namespace Shadowrun.LocalService.Core.Protocols
 {
     public sealed partial class APlayTcpStub
     {
+        private sealed class CoopMissionSessionState
+        {
+            public CoopMissionSessionState(string coopGroupName)
+            {
+                CoopGroupName = coopGroupName;
+                SyncRoot = new object();
+                CreatedUtc = DateTime.UtcNow;
+            }
+
+            public readonly string CoopGroupName;
+            public readonly object SyncRoot;
+            public readonly DateTime CreatedUtc;
+
+            public string MapName;
+            public uint Seed0;
+            public uint Seed1;
+            public uint Seed2;
+            public uint Seed3;
+            public string CompressedMatchConfiguration;
+            public ServerSimulationSession Simulation;
+        }
+
         private const string DefaultHubId = "Act01_HUB_02";
         private const string FallbackSerializedHubState = "CwAAAEgAVQBCAF8AcwBjAGUAbgBlAF8AMQALAAAASABVAEIAXwBzAGMAZQBuAGUAXwAxAAA=";
-
         private static readonly object HenchmanCollectionCacheLock = new object();
         private static string CachedSerializedHenchmanCollection;
         private static DateTime CachedSerializedHenchmanCollectionLastWriteUtc;
@@ -38,6 +59,10 @@ namespace Shadowrun.LocalService.Core.Protocols
         private static readonly Dictionary<string, Dictionary<string, int>> CachedShopPrices = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
         private static DateTime CachedShopPricesLastWriteUtc;
         private static string CachedShopPricesPath;
+
+        private readonly object _coopMissionLock = new object();
+        private readonly Dictionary<string, List<CoopMissionParticipant>> _coopMissionParticipants = new Dictionary<string, List<CoopMissionParticipant>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CoopMissionSessionState> _coopMissionSessions = new Dictionary<string, CoopMissionSessionState>(StringComparer.OrdinalIgnoreCase);
 
         private static string SerializeDefaultHenchmanCollection()
         {
@@ -1524,6 +1549,16 @@ namespace Shadowrun.LocalService.Core.Protocols
         private static readonly byte[] CoreIntroduceGameClientPayload = HexToBytes("012500000003010000000000000005001600000000090000003132372E302E302E3101000000000000000100000000000000");
         private static readonly byte[] CoreInitPayload = HexToBytes("0116000000000D02EA0710280000000100000001000000000000000100000000000000");
 
+        private const ulong DefaultIntroduceMsgNo = 1UL;
+        private const ulong AccountEntityId = 2UL;
+        private const ulong MetaGameplayEntityId = 3UL;
+        private const ulong HubEntityId = 4UL;
+        private const ushort GameClientConnectionTypeId = 5;
+
+        private long _nextGameClientEntityId = 1000;
+        private readonly object _identityEntityIdLock = new object();
+        private readonly Dictionary<Guid, ulong> _gameClientEntityIdByIdentity = new Dictionary<Guid, ulong>();
+
         private readonly LocalServiceOptions _options;
         private readonly RequestLogger _logger;
         private readonly LocalUserStore _userStore;
@@ -1639,6 +1674,119 @@ namespace Shadowrun.LocalService.Core.Protocols
             _sessionIdentityMap = sessionIdentityMap;
             _careerInfoGenerator = new CareerInfoGenerator(logger);
             _matchConfigurationGenerator = new MatchConfigurationGenerator(logger);
+        }
+
+        private ulong AllocateGameClientEntityId()
+        {
+            var next = Interlocked.Increment(ref _nextGameClientEntityId);
+            if (next <= 0)
+            {
+                // Should never happen, but avoid returning 0 which would break player ownership comparisons.
+                next = 1000;
+                Interlocked.Exchange(ref _nextGameClientEntityId, next);
+            }
+            return unchecked((ulong)next);
+        }
+
+        private void RegisterGameClientEntityIdForIdentity(Guid identityGuid, ulong gameClientEntityId, string peer)
+        {
+            if (identityGuid == Guid.Empty || gameClientEntityId == 0UL)
+            {
+                return;
+            }
+
+            lock (_identityEntityIdLock)
+            {
+                _gameClientEntityIdByIdentity[identityGuid] = gameClientEntityId;
+            }
+
+            _logger.Log(new
+            {
+                ts = RequestLogger.UtcNowIso(),
+                type = "aplay-identity-entityid",
+                peer = peer,
+                identityGuid = identityGuid,
+                gameClientEntityId = gameClientEntityId,
+            });
+        }
+
+        private bool TryGetGameClientEntityIdForIdentity(Guid identityGuid, out ulong gameClientEntityId)
+        {
+            gameClientEntityId = 0UL;
+            if (identityGuid == Guid.Empty)
+            {
+                return false;
+            }
+
+            lock (_identityEntityIdLock)
+            {
+                return _gameClientEntityIdByIdentity.TryGetValue(identityGuid, out gameClientEntityId) && gameClientEntityId != 0UL;
+            }
+        }
+
+        private static byte[] BuildCoreIntroduceGameClientPayload(ulong gameClientEntityId, string remoteAddress, ulong aplayClientId)
+        {
+            if (gameClientEntityId == 0UL)
+            {
+                gameClientEntityId = 1UL;
+            }
+            if (IsNullOrWhiteSpace(remoteAddress))
+            {
+                remoteAddress = "127.0.0.1";
+            }
+
+            // CRITICAL: the client is very picky about the introduce packet layout.
+            // The known-good hardcoded payload (`CoreIntroduceGameClientPayload`) is:
+            //   0x01 + int32(len) + 0x03 + uint64(entityId) + ushort(typeId=5) + int32(payloadLen) + payload + uint64(msgNo)
+            // Where:
+            //   - `len` does NOT include the trailing msgNo (it matches the captured 0x25 value for addr="127.0.0.1").
+            //   - `payload` is: uint8(isAdmin=0) + int32(addrLen) + ASCII(addr) + uint64(aplayClientId)
+
+            var addrBytes = Encoding.ASCII.GetBytes(remoteAddress);
+            var payload = Concat(
+                new byte[] { 0 },
+                BitConverter.GetBytes(addrBytes.Length),
+                addrBytes,
+                BitConverter.GetBytes(aplayClientId));
+
+            var len = 1 + 8 + 2 + 4 + payload.Length;
+            return Concat(
+                new byte[] { 0x01 },
+                BitConverter.GetBytes(len),
+                new byte[] { 0x03 },
+                BitConverter.GetBytes(gameClientEntityId),
+                BitConverter.GetBytes(GameClientConnectionTypeId),
+                BitConverter.GetBytes(payload.Length),
+                payload,
+                BitConverter.GetBytes(DefaultIntroduceMsgNo));
+        }
+
+        private static byte[] BuildCoreApInitializedPayload(uint connectedServerId, ulong entityId, ulong msgNo)
+        {
+            // APlay-level message type 0 (Initialized):
+            //   uint8(type=0) + APDateTime(9 bytes) + uint32(connectedServerId) + uint64(entityId)
+            var raw = Concat(
+                new byte[] { 0 },
+                BuildApDatePayload(DateTimeOffset.UtcNow),
+                BitConverter.GetBytes(connectedServerId),
+                BitConverter.GetBytes(entityId));
+
+            return Concat(
+                new byte[] { 0x01 },
+                BitConverter.GetBytes(raw.Length),
+                raw,
+                BitConverter.GetBytes(msgNo));
+        }
+
+        private static byte[] BuildCoreWelcomePayload(ulong id, ulong secret, ulong lastClientMsgNo)
+        {
+            // Core message type 0 (Welcome): uint8(type=0) + uint64(id) + uint64(secret) + uint64(lastClientMsgNo)
+            var raw = Concat(
+                new byte[] { 0 },
+                BitConverter.GetBytes(id),
+                BitConverter.GetBytes(secret),
+                BitConverter.GetBytes(lastClientMsgNo));
+            return Concat(BitConverter.GetBytes(raw.Length), raw);
         }
 
         private void SendPendingLootPreviews(ServerSimulationSession simulationSession, System.Net.Sockets.NetworkStream stream, string peer, ulong msgNoBase)
@@ -1892,6 +2040,12 @@ namespace Shadowrun.LocalService.Core.Protocols
                 {
                     const int EndTeamTurnSkillId = 99997;
 
+                    // The client uses `GameClientConnection.APlayEntityId` as its local PlayerID.
+                    // To make coop ownership work, each connection must have a unique entity id.
+                    var gameClientEntityId = AllocateGameClientEntityId();
+                    var gameClientIntroducePayload = BuildCoreIntroduceGameClientPayload(gameClientEntityId, "127.0.0.1", 1UL);
+                    var apInitializedPayload = BuildCoreApInitializedPayload(1U, gameClientEntityId, DefaultIntroduceMsgNo + 1UL);
+
                     var connectionClosed = new ManualResetEvent(false);
                     var keepAliveLoopStarted = false;
                     long keepAliveMsgNo = 500000;
@@ -1953,8 +2107,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                     // Keyed by map name (e.g., "1_010_Prologue").
                     var completedStoryMissions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     string currentMissionMapName = null;
+                    string currentCoopGroupName = null;
 
                     ServerSimulationSession simulationSession = null;
+                    object simulationSessionSync = null;
 
                     const ulong gameworldEntityId = 5;
                     const ulong missionInstanceEntityId = 6;
@@ -2020,15 +2176,12 @@ namespace Shadowrun.LocalService.Core.Protocols
                             }
                             _logger.Log(decodedLog);
 
-                            if (asciiFrame == "AQAAAAA=")
+                            // Client "hello" is a Core.Client->Server message: RawData(len=1, payload={0x00}).
+                            // That decodes to: int32(1) + uint8(0). Some clients may base64-encode it as "AQAAAAA=".
+                            if (decoded.Length == 5 && ReadInt32LE(decoded, 0) == 1 && decoded[4] == 0)
                             {
-                                var responseDecoded = Concat(
-                                    BitConverter.GetBytes(2),
-                                    new byte[] { 0 },
-                                    BitConverter.GetBytes((ulong)1),
-                                    BitConverter.GetBytes((ulong)1),
-                                    BitConverter.GetBytes((ulong)1));
-                                SendRawFrame(stream, peer, responseDecoded, "sent core welcome");
+                                var welcome = BuildCoreWelcomePayload(1UL, 1UL, 0UL);
+                                SendRawFrame(stream, peer, welcome, "sent core welcome");
                             }
 
                             if (decoded.Length < 8)
@@ -2048,13 +2201,14 @@ namespace Shadowrun.LocalService.Core.Protocols
                             {
                                 if (!sentIntro)
                                 {
-                                    SendRawFrame(stream, peer, PrefixLength(CoreIntroduceGameClientPayload), "sent AP introduce shared entity (type=5 game client connection)");
+                                    SendRawFrame(stream, peer, PrefixLength(gameClientIntroducePayload), "sent AP introduce shared entity (type=5 game client connection)");
                                     sentIntro = true;
                                 }
 
                                 if (!sentInit)
                                 {
-                                    SendRawFrame(stream, peer, PrefixLength(CoreInitPayload), "sent AP initialized in response to AP hello");
+                                    // IMPORTANT: entityId in Initialized must match the player's entity id.
+                                    SendRawFrame(stream, peer, PrefixLength(apInitializedPayload), "sent AP initialized in response to AP hello (entityId=" + gameClientEntityId + ")");
                                     sentInit = true;
                                 }
                             }
@@ -2106,13 +2260,30 @@ namespace Shadowrun.LocalService.Core.Protocols
                             }
 
                             var isRegularConnect = shared.Value.ApMsgId == 1
-                                && shared.Value.EntityId == 1
                                 && shared.Value.FieldId == 3
                                 && PayloadContains(payloadStrings, "RegularConnect");
 
                             if (isRegularConnect && !sentRegularConnectReply)
                             {
                                 var serverMsgNoBase = direct.Value.MsgNo;
+
+                                // In theory, the client should call RequestToLogin on the entity id we introduced.
+                                // In practice, if our introduce payload doesn't get applied as expected, it may keep
+                                // using a different (often small) entity id. Adopt the id the client is actually using
+                                // so subsequent Welcome/KeepAlive traffic targets the correct shared entity.
+                                if (shared.Value.EntityId != 0UL && shared.Value.EntityId != gameClientEntityId)
+                                {
+                                    _logger.Log(new
+                                    {
+                                        ts = RequestLogger.UtcNowIso(),
+                                        type = "aplay-gameclient-entityid-adopted",
+                                        peer = peer,
+                                        previousEntityId = gameClientEntityId,
+                                        adoptedEntityId = shared.Value.EntityId,
+                                    });
+
+                                    gameClientEntityId = shared.Value.EntityId;
+                                }
 
                                 // RequestToLogin(sessionHash, deviceModel, loginMethod). The loginMethod is typically "RegularConnect".
                                 // Enforced: the session hash must map to a known identity (minted via Steam/Authenticate).
@@ -2162,22 +2333,22 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                 if (!sentAccountIntro)
                                 {
-                                    var accountIntroRaw = Concat(new byte[] { 3 }, BitConverter.GetBytes((ulong)2), BitConverter.GetBytes((ushort)3), BitConverter.GetBytes(0));
+                                    var accountIntroRaw = Concat(new byte[] { 3 }, BitConverter.GetBytes(AccountEntityId), BitConverter.GetBytes((ushort)3), BitConverter.GetBytes(0));
                                     var accountIntroCore = BuildCoreDirectSystem(1, accountIntroRaw, serverMsgNoBase + 1);
-                                    SendRawFrame(stream, peer, PrefixLength(accountIntroCore), "sent AP introduce shared entity (type=3 account communication object, id=2)");
+                                    SendRawFrame(stream, peer, PrefixLength(accountIntroCore), "sent AP introduce shared entity (type=3 account communication object, id=" + AccountEntityId + ")");
                                     sentAccountIntro = true;
                                 }
 
-                                var gameClientOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(1, 5), serverMsgNoBase + 2);
-                                SendRawFrame(stream, peer, PrefixLength(gameClientOwnerCore), "sent AP shared-entity set-owner (entity=1)");
+                                var gameClientOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(gameClientEntityId, GameClientConnectionTypeId), serverMsgNoBase + 2);
+                                SendRawFrame(stream, peer, PrefixLength(gameClientOwnerCore), "sent AP shared-entity set-owner (entity=" + gameClientEntityId + ")");
 
-                                var accountOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(2, 3), serverMsgNoBase + 3);
-                                SendRawFrame(stream, peer, PrefixLength(accountOwnerCore), "sent AP shared-entity set-owner (entity=2)");
+                                var accountOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(AccountEntityId, 3), serverMsgNoBase + 3);
+                                SendRawFrame(stream, peer, PrefixLength(accountOwnerCore), "sent AP shared-entity set-owner (entity=" + AccountEntityId + ")");
 
                                 if (rejectReason != null)
                                 {
                                     var rejectPayload = BuildUtf16StringPayload(rejectReason);
-                                    var rejectCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 5, rejectPayload), serverMsgNoBase + 4);
+                                    var rejectCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameClientEntityId, 5, rejectPayload), serverMsgNoBase + 4);
                                     SendRawFrame(stream, peer, PrefixLength(rejectCore), "sent GameClientConnection RejectLogin in response to RegularConnect");
                                     connectionClosed.Set();
                                     return;
@@ -2185,14 +2356,15 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                 activeIdentityHash = mappedIdentityHash;
                                 activeIdentityGuid = mappedIdentityGuid;
+                                RegisterGameClientEntityIdForIdentity(activeIdentityGuid, gameClientEntityId, peer);
 
                                 var careerSummary = BuildCareerSummaryJson(_userStore != null ? _userStore.GetCareers(activeIdentityHash) : null);
-                                var welcomePayload = BuildGameClientWelcomePayload(2, careerSummary);
-                                var welcomeCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 4, welcomePayload), serverMsgNoBase + 4);
+                                var welcomePayload = BuildGameClientWelcomePayload(AccountEntityId, careerSummary);
+                                var welcomeCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameClientEntityId, 4, welcomePayload), serverMsgNoBase + 4);
                                 SendRawFrame(stream, peer, PrefixLength(welcomeCore), "sent GameClientConnection Welcome in response to RegularConnect");
                                 sentRegularConnectReply = true;
 
-                                var keepAliveCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 6, new byte[0]), serverMsgNoBase + 5);
+                                var keepAliveCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameClientEntityId, 6, new byte[0]), serverMsgNoBase + 5);
                                 SendRawFrame(stream, peer, PrefixLength(keepAliveCore), "sent GameClientConnection KeepAlive after Welcome");
 
                                 // The client expects periodic keep-alives; otherwise it may drop the socket shortly after
@@ -2213,7 +2385,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             try
                                             {
                                                 var msgNo = unchecked((ulong)Interlocked.Increment(ref keepAliveMsgNo));
-                                                var periodicKeepAliveCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 6, new byte[0]), msgNo);
+                                                var periodicKeepAliveCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameClientEntityId, 6, new byte[0]), msgNo);
                                                 SendRawFrame(stream, peer, PrefixLength(periodicKeepAliveCore), "sent GameClientConnection KeepAlive (periodic)");
                                             }
                                             catch
@@ -2279,7 +2451,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 if (IsNullOrWhiteSpace(activeIdentityHash) || activeIdentityGuid == Guid.Empty)
                                 {
                                     var rejectPayload = BuildUtf16StringPayload("Not logged in.");
-                                    var rejectCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 1, 5, rejectPayload), serverMsgNoBase + 4);
+                                    var rejectCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameClientEntityId, 5, rejectPayload), serverMsgNoBase + 4);
                                     SendRawFrame(stream, peer, PrefixLength(rejectCore), "sent GameClientConnection RejectLogin (EnterCareer before login)");
                                     connectionClosed.Set();
                                     return;
@@ -2571,6 +2743,320 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 && shared.Value.EntityId == 3
                                 && shared.Value.FieldId == 8
                                 && payloadStrings.Count > 0;
+
+                            // Coop mission start (group-based) does not come through MetaGameplayCommunicationObject.Message.
+                            // Instead, the client sends a UTF-16 string payload like:
+                            //   CoopGroup<guid>_On_<mapName>S, ["<account>:0", ...], <mapName>, []
+                            // If we don't respond with StartMissionAccepted/StartMissionForClients, the UI will sit at
+                            // "Waiting for Game Server..." forever.
+                            var isCoopMissionStart = payloadStrings.Count > 0
+                                && !IsNullOrWhiteSpace(payloadStrings[0])
+                                && payloadStrings[0].StartsWith("CoopGroup", StringComparison.OrdinalIgnoreCase)
+                                && payloadStrings[0].IndexOf("_On_", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                            if (isCoopMissionStart)
+                            {
+                                var coopGroupName = payloadStrings[0];
+
+                                string mapName = null;
+                                if (payloadStrings.Count >= 3 && !IsNullOrWhiteSpace(payloadStrings[2]))
+                                {
+                                    mapName = payloadStrings[2];
+                                }
+                                else
+                                {
+                                    var onIdx = coopGroupName.IndexOf("_On_", StringComparison.OrdinalIgnoreCase);
+                                    if (onIdx >= 0)
+                                    {
+                                        mapName = coopGroupName.Substring(onIdx + 4);
+                                        if (!IsNullOrWhiteSpace(mapName) && mapName.EndsWith("S", StringComparison.Ordinal))
+                                        {
+                                            mapName = mapName.Substring(0, mapName.Length - 1);
+                                        }
+                                    }
+                                }
+
+                                if (IsNullOrWhiteSpace(mapName))
+                                {
+                                    mapName = "1_010_Prologue";
+                                }
+
+                                currentMissionMapName = mapName;
+
+                                _logger.Log(new
+                                {
+                                    ts = RequestLogger.UtcNowIso(),
+                                    type = "coop-mission-start",
+                                    peer = peer,
+                                    apMsgId = shared.Value.ApMsgId,
+                                    entityId = shared.Value.EntityId,
+                                    fieldId = shared.Value.FieldId,
+                                    coopGroupName = coopGroupName,
+                                    mapName = mapName,
+                                    memberList = payloadStrings.Count > 1 ? payloadStrings[1] : null,
+                                });
+
+                                currentCoopGroupName = coopGroupName;
+                                RegisterCoopMissionParticipant(coopGroupName, peer, stream);
+
+                                // If the mission was already completed locally, cancel like we do for DirectStart story missions.
+                                if (completedStoryMissions.Contains(mapName))
+                                {
+                                    var nudgeMsgNoBase = direct.Value.MsgNo + 250;
+                                    var cancelledCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 24, new byte[0]), nudgeMsgNoBase);
+                                    SendRawFrame(stream, peer, PrefixLength(cancelledCore), "sent MetaGameplayCommunicationObject StartMissionCancelled (coop mission already completed)");
+                                    continue;
+                                }
+
+                                var requestMsgNoBase = direct.Value.MsgNo + 250;
+
+                                if (!sentMissionEntityIntros)
+                                {
+                                    var gameworldIntroRaw = Concat(new byte[] { 3 }, BitConverter.GetBytes((ulong)gameworldEntityId), BitConverter.GetBytes(gameworldCommunicationObjectTypeId), BitConverter.GetBytes(0));
+                                    var gameworldIntroCore = BuildCoreDirectSystem(1, gameworldIntroRaw, requestMsgNoBase + 1);
+                                    SendRawFrame(stream, peer, PrefixLength(gameworldIntroCore), "sent AP introduce shared entity (type=7 gameworld communication object, id=5)");
+
+                                    var missionInstanceIntroRaw = Concat(new byte[] { 3 }, BitConverter.GetBytes((ulong)missionInstanceEntityId), BitConverter.GetBytes(missionInstanceCommunicationObjectTypeId), BitConverter.GetBytes(0));
+                                    var missionInstanceIntroCore = BuildCoreDirectSystem(1, missionInstanceIntroRaw, requestMsgNoBase + 2);
+                                    SendRawFrame(stream, peer, PrefixLength(missionInstanceIntroCore), "sent AP introduce shared entity (type=9 mission instance communication object, id=6)");
+
+                                    var missionCommandIntroRaw = Concat(new byte[] { 3 }, BitConverter.GetBytes((ulong)missionCommandEntityId), BitConverter.GetBytes(missionCommandCommunicationObjectTypeId), BitConverter.GetBytes(0));
+                                    var missionCommandIntroCore = BuildCoreDirectSystem(1, missionCommandIntroRaw, requestMsgNoBase + 3);
+                                    SendRawFrame(stream, peer, PrefixLength(missionCommandIntroCore), "sent AP introduce shared entity (type=10 mission command communication object, id=7)");
+
+                                    var gameworldOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(gameworldEntityId, gameworldCommunicationObjectTypeId), requestMsgNoBase + 4);
+                                    SendRawFrame(stream, peer, PrefixLength(gameworldOwnerCore), "sent AP shared-entity set-owner (entity=5)");
+
+                                    var missionInstanceOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(missionInstanceEntityId, missionInstanceCommunicationObjectTypeId), requestMsgNoBase + 5);
+                                    SendRawFrame(stream, peer, PrefixLength(missionInstanceOwnerCore), "sent AP shared-entity set-owner (entity=6)");
+
+                                    var missionCommandOwnerCore = BuildCoreDirectSystem(1, BuildApSharedEntitySetOwner(missionCommandEntityId, missionCommandCommunicationObjectTypeId), requestMsgNoBase + 6);
+                                    SendRawFrame(stream, peer, PrefixLength(missionCommandOwnerCore), "sent AP shared-entity set-owner (entity=7)");
+
+                                    sentMissionEntityIntros = true;
+                                }
+
+                                var seed0 = 0x11111111u;
+                                var seed1 = 0x22222222u;
+                                var seed2 = 0x33333333u;
+                                var seed3 = 0x44444444u;
+
+                                var compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeCharacterName, gameClientEntityId);
+
+                                // Best-effort: build a two-human coop roster based on the member list the client sends.
+                                // If parsing fails, fall back to a single-player roster (better than blocking mission start).
+                                if (_userStore != null)
+                                {
+                                    try
+                                    {
+                                        var memberListRaw = payloadStrings.Count > 1 ? payloadStrings[1] : null;
+                                        var memberGuids = ParseGuidsFromLooseText(memberListRaw, 8);
+                                        if (memberGuids == null || memberGuids.Length == 0)
+                                        {
+                                            memberGuids = new Guid[] { activeIdentityGuid };
+                                        }
+                                        if (!ContainsGuid(memberGuids, activeIdentityGuid))
+                                        {
+                                            var extended = new Guid[memberGuids.Length + 1];
+                                            Array.Copy(memberGuids, 0, extended, 0, memberGuids.Length);
+                                            extended[extended.Length - 1] = activeIdentityGuid;
+                                            memberGuids = extended;
+                                        }
+
+                                        // Client parties are practically capped (observed up to 4). Don't hard-fail if more are listed.
+                                        var maxHumans = 4;
+                                        if (memberGuids.Length > maxHumans)
+                                        {
+                                            var truncated = new Guid[maxHumans];
+                                            Array.Copy(memberGuids, 0, truncated, 0, maxHumans);
+                                            memberGuids = truncated;
+                                        }
+
+                                        if (memberGuids.Length >= 2)
+                                        {
+                                            // Stable ordering so both clients generate the same blob.
+                                            Array.Sort(memberGuids, GuidStringOrdinalComparer.Instance);
+
+                                            Guid leaderAccountId;
+                                            if (CoopGroupHostRegistry.TryGetLeader(coopGroupName, out leaderAccountId))
+                                            {
+                                                memberGuids = OrderGuidsWithLeaderFirst(memberGuids, leaderAccountId);
+                                            }
+
+                                            var identityGuids = memberGuids;
+                                            var careerIndices = new int[identityGuids.Length];
+                                            var slots = new CareerSlot[identityGuids.Length];
+                                            var playerIds = new ulong[identityGuids.Length];
+
+                                            for (var i = 0; i < identityGuids.Length; i++)
+                                            {
+                                                var guid = identityGuids[i];
+                                                var hash = guid.ToString();
+                                                var idx = guid == activeIdentityGuid ? activeCareerIndex : _userStore.GetLastCareerIndex(hash);
+                                                if (idx < 0) idx = 0;
+                                                careerIndices[i] = idx;
+                                                slots[i] = _userStore.GetOrCreateCareer(hash, idx, false);
+
+                                                ulong mappedEntityId;
+                                                if (!TryGetGameClientEntityIdForIdentity(guid, out mappedEntityId) || mappedEntityId == 0UL)
+                                                {
+                                                    // If another client hasn't logged in yet, fall back to a deterministic non-zero id.
+                                                    mappedEntityId = ComputeFnv1a64(guid.ToByteArray());
+                                                    if (mappedEntityId == 0UL)
+                                                    {
+                                                        mappedEntityId = (ulong)(i + 1);
+                                                    }
+                                                }
+                                                playerIds[i] = mappedEntityId;
+                                            }
+
+                                            compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedCoopMatchConfiguration(mapName, identityGuids, careerIndices, slots, playerIds);
+                                        }
+                                        else
+                                        {
+                                            var activeSlot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
+                                            if (activeSlot != null)
+                                            {
+                                                compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeSlot, null, gameClientEntityId);
+                                            }
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        // Ignore; mission start will proceed with the default single-player config.
+                                    }
+                                }
+
+                                // Coop missions must share one authoritative simulation across all peers.
+                                // If each TCP connection has its own sim, neither side will ever observe the other
+                                // player exhausting actions, so the team never ends and AI turns never start.
+                                CoopMissionSessionState coopSession;
+                                lock (_coopMissionLock)
+                                {
+                                    if (!_coopMissionSessions.TryGetValue(coopGroupName, out coopSession) || coopSession == null)
+                                    {
+                                        coopSession = new CoopMissionSessionState(coopGroupName);
+                                        _coopMissionSessions[coopGroupName] = coopSession;
+                                    }
+                                }
+
+                                simulationSessionSync = coopSession.SyncRoot;
+
+                                lock (coopSession.SyncRoot)
+                                {
+                                    if (coopSession.Simulation != null
+                                        && !IsNullOrWhiteSpace(coopSession.CompressedMatchConfiguration)
+                                        && string.Equals(coopSession.MapName, mapName, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        // Reuse existing mission session.
+                                        simulationSession = coopSession.Simulation;
+                                        seed0 = coopSession.Seed0;
+                                        seed1 = coopSession.Seed1;
+                                        seed2 = coopSession.Seed2;
+                                        seed3 = coopSession.Seed3;
+                                        compressedMatchConfiguration = coopSession.CompressedMatchConfiguration;
+
+                                        _logger.Log(new
+                                        {
+                                            ts = RequestLogger.UtcNowIso(),
+                                            type = "sim",
+                                            peer = peer,
+                                            status = "coop-reuse",
+                                            mapName = mapName,
+                                            coopGroupName = coopGroupName,
+                                        });
+                                    }
+                                    else
+                                    {
+                                        try
+                                        {
+                                            var storyLineForLoot = "Main Campaign";
+                                            var chapterForLoot = 0;
+                                            if (_userStore != null)
+                                            {
+                                                try
+                                                {
+                                                    var slotForLoot = !IsNullOrWhiteSpace(activeIdentityHash) ? _userStore.GetOrCreateCareer(activeIdentityHash, activeCareerIndex, false) : null;
+                                                    if (slotForLoot != null)
+                                                    {
+                                                        chapterForLoot = slotForLoot.MainCampaignCurrentChapter;
+                                                    }
+                                                }
+                                                catch
+                                                {
+                                                }
+                                            }
+
+                                            coopSession.MapName = mapName;
+                                            coopSession.Seed0 = seed0;
+                                            coopSession.Seed1 = seed1;
+                                            coopSession.Seed2 = seed2;
+                                            coopSession.Seed3 = seed3;
+                                            coopSession.CompressedMatchConfiguration = compressedMatchConfiguration;
+                                            coopSession.Simulation = ServerSimulationSession.Create(
+                                                _logger,
+                                                peer,
+                                                _options.StaticDataDir,
+                                                _options.StreamingAssetsDir,
+                                                mapName,
+                                                compressedMatchConfiguration,
+                                                seed0,
+                                                seed1,
+                                                seed2,
+                                                seed3,
+                                                storyLineForLoot,
+                                                chapterForLoot,
+                                                _options != null && _options.EnableAiLogic);
+                                            simulationSession = coopSession.Simulation;
+
+                                            _logger.Log(new
+                                            {
+                                                ts = RequestLogger.UtcNowIso(),
+                                                type = "sim",
+                                                peer = peer,
+                                                status = "coop-created",
+                                                mapName = mapName,
+                                                coopGroupName = coopGroupName,
+                                            });
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            coopSession.Simulation = null;
+                                            simulationSession = null;
+                                            _logger.Log(new
+                                            {
+                                                ts = RequestLogger.UtcNowIso(),
+                                                type = "sim",
+                                                peer = peer,
+                                                status = "failed",
+                                                mapName = mapName,
+                                                coopGroupName = coopGroupName,
+                                                message = ex.Message,
+                                            });
+                                        }
+                                    }
+                                }
+
+                                var startMissionAcceptedPayload = Concat(
+                                    BitConverter.GetBytes(1L),
+                                    BitConverter.GetBytes(seed0),
+                                    BitConverter.GetBytes(seed1),
+                                    BitConverter.GetBytes(seed2),
+                                    BitConverter.GetBytes(seed3),
+                                    BuildUtf16StringPayload(compressedMatchConfiguration),
+                                    BitConverter.GetBytes((ulong)gameworldEntityId),
+                                    BitConverter.GetBytes((ulong)missionInstanceEntityId),
+                                    BitConverter.GetBytes((ulong)missionCommandEntityId));
+
+                                var startMissionAcceptedCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 23, startMissionAcceptedPayload), requestMsgNoBase + 7);
+                                SendRawFrame(stream, peer, PrefixLength(startMissionAcceptedCore), "sent MetaGameplayCommunicationObject StartMissionAccepted (coop map=" + mapName + ")");
+
+                                SleepWithStop(stopEvent, 6000);
+                                var startMissionForClientsCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, missionInstanceEntityId, 0, new byte[0]), requestMsgNoBase + 8);
+                                SendRawFrame(stream, peer, PrefixLength(startMissionForClientsCore), "sent MissionInstanceCommunicationObject StartMissionForClients (coop)");
+
+                                continue;
+                            }
 
                             if (_userStore != null && isMetaGameplayChangeSkillTrees)
                             {
@@ -4375,8 +4861,8 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     }
 
                                     var compressedMatchConfiguration = (selectedHenchmen != null && selectedHenchmen.Length > 0)
-                                        ? _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeCharacterName, selectedHenchmen)
-                                        : _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeCharacterName);
+                                        ? _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeCharacterName, selectedHenchmen, gameClientEntityId)
+                                        : _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeCharacterName, gameClientEntityId);
                                     if (_userStore != null)
                                     {
                                         try
@@ -4386,11 +4872,11 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             {
                                                 if (selectedHenchmen != null && selectedHenchmen.Length > 0)
                                                 {
-                                                    compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeSlot, selectedHenchmen);
+                                                    compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeSlot, selectedHenchmen, gameClientEntityId);
                                                 }
                                                 else
                                                 {
-                                                    compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeSlot);
+                                                    compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedMatchConfiguration(mapName, activeIdentityGuid, activeCareerIndex, activeSlot, null, gameClientEntityId);
                                                 }
                                             }
                                         }
@@ -4523,8 +5009,8 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         };
                                     }
 
-                                    // In our generated match configuration, the local human player is always ID=1.
-                                    const ulong participantId = 1UL;
+                                    // Participant id is the local player's PlayerID, which maps to the GameClientConnection entity id.
+                                    var participantId = gameClientEntityId;
 
                                     // Distinguish leaving after a real mission end (Victory/Defeat flow) from leaving mid-mission.
                                     // If the sim is still running, treat LeaveMission as an abort/fail: do not grant completion credit
@@ -4979,14 +5465,27 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                     if (simulationSession != null)
                                     {
-                                        try
+                                        // For coop missions, simulation is shared across peers. Don't stop it on the
+                                        // first client to leave; stop it only when the last participant unregisters.
+                                        if (!IsNullOrWhiteSpace(currentCoopGroupName))
                                         {
-                                            simulationSession.Stop();
+                                            UnregisterCoopMissionParticipant(currentCoopGroupName, peer);
+                                            currentCoopGroupName = null;
+                                            simulationSession = null;
+                                            simulationSessionSync = null;
                                         }
-                                        catch
+                                        else
                                         {
+                                            try
+                                            {
+                                                simulationSession.Stop();
+                                            }
+                                            catch
+                                            {
+                                            }
+                                            simulationSession = null;
+                                            simulationSessionSync = null;
                                         }
-                                        simulationSession = null;
                                     }
                                 }
 
@@ -5043,7 +5542,37 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             var seedPkg = new Cliffhanger.SRO.ServerClientCommons.Gameworld.Communication.SeedPackage(seed0, seed1, seed2, seed3);
                                             if (simulationSession != null)
                                             {
-                                                seedPkg = simulationSession.CreateSeedPackage();
+                                                try
+                                                {
+                                                    if (simulationSessionSync != null)
+                                                    {
+                                                        lock (simulationSessionSync)
+                                                        {
+                                                            seedPkg = simulationSession.CreateSeedPackage();
+                                                            simulationSession.ExecuteActivateSkill(a, b, c, d, e, f, seedPkg);
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        seedPkg = simulationSession.CreateSeedPackage();
+                                                        simulationSession.ExecuteActivateSkill(a, b, c, d, e, f, seedPkg);
+                                                    }
+                                                }
+                                                catch (Exception ex)
+                                                {
+                                                    _logger.Log(new
+                                                    {
+                                                        ts = RequestLogger.UtcNowIso(),
+                                                        type = "sim",
+                                                        peer = peer,
+                                                        status = "execute-failed",
+                                                        cmd = "ActivateActiveSkill",
+                                                        skillId = c,
+                                                        agentId = d,
+                                                        message = ex.Message,
+                                                    });
+                                                }
+
                                                 seed0 = seedPkg.Seed0;
                                                 seed1 = seedPkg.Seed1;
                                                 seed2 = seedPkg.Seed2;
@@ -5063,28 +5592,6 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 BitConverter.GetBytes(seed3));
 
                                             activateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 2, activatePayload), responseMsgNoBase + 2);
-
-                                            if (simulationSession != null)
-                                            {
-                                                try
-                                                {
-                                                    simulationSession.ExecuteActivateSkill(a, b, c, d, e, f, seedPkg);
-                                                }
-                                                catch (Exception ex)
-                                                {
-                                                    _logger.Log(new
-                                                    {
-                                                        ts = RequestLogger.UtcNowIso(),
-                                                        type = "sim",
-                                                        peer = peer,
-                                                        status = "execute-failed",
-                                                        cmd = "ActivateActiveSkill",
-                                                        skillId = c,
-                                                        agentId = d,
-                                                        message = ex.Message,
-                                                    });
-                                                }
-                                            }
                                         }
                                     }
                                 }
@@ -5101,12 +5608,26 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 if (followPathCore != null)
                                 {
                                     SendRawFrame(stream, peer, PrefixLength(followPathCore), "echoed GameworldCommunicationObject FollowPath from MissionCommand");
+                                    BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(followPathCore), "echoed GameworldCommunicationObject FollowPath from MissionCommand (coop bcast)");
 
                                     if (simulationSession != null && followPathAgentId.HasValue && followPathTargetX.HasValue && followPathTargetY.HasValue)
                                     {
+                                        IList<ServerSimulationSession.AiTurnAction> aiActions = null;
                                         try
                                         {
-                                            simulationSession.ExecuteFollowPath(followPathAgentId.Value, followPathTargetX.Value, followPathTargetY.Value);
+                                            if (simulationSessionSync != null)
+                                            {
+                                                lock (simulationSessionSync)
+                                                {
+                                                    simulationSession.ExecuteFollowPath(followPathAgentId.Value, followPathTargetX.Value, followPathTargetY.Value);
+                                                    aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                                }
+                                            }
+                                            else
+                                            {
+                                                simulationSession.ExecuteFollowPath(followPathAgentId.Value, followPathTargetX.Value, followPathTargetY.Value);
+                                                aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                            }
                                         }
                                         catch (Exception ex)
                                         {
@@ -5128,7 +5649,6 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         // moved to an AI team, immediately skip AI turns here too.
                                         try
                                         {
-                                            var aiActions = simulationSession.SkipAiTurnsIfNeeded();
                                             if (aiActions != null && aiActions.Count > 0)
                                             {
                                                 // Use sequential message numbers immediately after the echoed mission command.
@@ -5146,6 +5666,7 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                                         var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 1, payload), baseMsgNo + (ulong)idx);
                                                         SendRawFrame(stream, peer, PrefixLength(core), "sim: AI FollowPath (agentId=" + aiAction.AgentId + ", x=" + aiAction.TargetX + ", y=" + aiAction.TargetY + ")");
+                                                        BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(core), "sim: AI FollowPath (coop bcast) (agentId=" + aiAction.AgentId + ")");
                                                     }
                                                     else
                                                     {
@@ -5170,10 +5691,12 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                         if (aiAction.SkillId == EndTeamTurnSkillId)
                                                         {
                                                             SendRawFrame(stream, peer, PrefixLength(core), "sim: auto-ended AI team turn (agentId=" + aiAction.AgentId + ")");
+                                                            BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(core), "sim: auto-ended AI team turn (coop bcast) (agentId=" + aiAction.AgentId + ")");
                                                         }
                                                         else
                                                         {
                                                             SendRawFrame(stream, peer, PrefixLength(core), "sim: AI ActivateActiveSkill (agentId=" + aiAction.AgentId + ", skillId=" + aiAction.SkillId + ")");
+                                                            BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(core), "sim: AI ActivateActiveSkill (coop bcast) (agentId=" + aiAction.AgentId + ", skillId=" + aiAction.SkillId + ")");
                                                         }
                                                     }
                                                     idx++;
@@ -5199,13 +5722,25 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 if (activateCore != null)
                                 {
                                     SendRawFrame(stream, peer, PrefixLength(activateCore), "echoed GameworldCommunicationObject ActivateActiveSkill from MissionCommand");
+                                    BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(activateCore), "echoed GameworldCommunicationObject ActivateActiveSkill from MissionCommand (coop bcast)");
 
                                     if (simulationSession != null)
                                     {
                                         // If the authoritative simulation moved to an AI team, immediately skip AI turns.
                                         try
                                         {
-                                            var aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                            IList<ServerSimulationSession.AiTurnAction> aiActions;
+                                            if (simulationSessionSync != null)
+                                            {
+                                                lock (simulationSessionSync)
+                                                {
+                                                    aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                                }
+                                            }
+                                            else
+                                            {
+                                                aiActions = simulationSession.SkipAiTurnsIfNeeded();
+                                            }
                                             if (aiActions != null && aiActions.Count > 0)
                                             {
                                                 // Use sequential message numbers immediately after the echoed mission command.
@@ -5223,6 +5758,7 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                                         var core = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, gameworldEntityId, 1, payload), baseMsgNo + (ulong)idx);
                                                         SendRawFrame(stream, peer, PrefixLength(core), "sim: AI FollowPath (agentId=" + aiAction.AgentId + ", x=" + aiAction.TargetX + ", y=" + aiAction.TargetY + ")");
+                                                        BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(core), "sim: AI FollowPath (coop bcast) (agentId=" + aiAction.AgentId + ")");
                                                     }
                                                     else
                                                     {
@@ -5247,10 +5783,12 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                         if (aiAction.SkillId == EndTeamTurnSkillId)
                                                         {
                                                             SendRawFrame(stream, peer, PrefixLength(core), "sim: auto-ended AI team turn (agentId=" + aiAction.AgentId + ")");
+                                                            BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(core), "sim: auto-ended AI team turn (coop bcast) (agentId=" + aiAction.AgentId + ")");
                                                         }
                                                         else
                                                         {
                                                             SendRawFrame(stream, peer, PrefixLength(core), "sim: AI ActivateActiveSkill (agentId=" + aiAction.AgentId + ", skillId=" + aiAction.SkillId + ")");
+                                                            BroadcastToCoopMissionPeers(currentCoopGroupName, peer, PrefixLength(core), "sim: AI ActivateActiveSkill (coop bcast) (agentId=" + aiAction.AgentId + ", skillId=" + aiAction.SkillId + ")");
                                                         }
                                                     }
                                                     idx++;
@@ -5286,6 +5824,131 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                         buffer.AddRange(chunk);
                     }
+
+                    if (!IsNullOrWhiteSpace(currentCoopGroupName))
+                    {
+                        UnregisterCoopMissionParticipant(currentCoopGroupName, peer);
+                    }
+                }
+            }
+        }
+
+        private void RegisterCoopMissionParticipant(string coopGroupName, string peer, NetworkStream stream)
+        {
+            if (IsNullOrWhiteSpace(coopGroupName) || stream == null)
+            {
+                return;
+            }
+
+            lock (_coopMissionLock)
+            {
+                List<CoopMissionParticipant> list;
+                if (!_coopMissionParticipants.TryGetValue(coopGroupName, out list) || list == null)
+                {
+                    list = new List<CoopMissionParticipant>();
+                    _coopMissionParticipants[coopGroupName] = list;
+                }
+
+                // Remove existing entries for this peer (reconnects).
+                for (var i = list.Count - 1; i >= 0; i--)
+                {
+                    if (list[i] == null || string.Equals(list[i].Peer, peer, StringComparison.OrdinalIgnoreCase))
+                    {
+                        list.RemoveAt(i);
+                    }
+                }
+
+                list.Add(new CoopMissionParticipant(peer, stream));
+            }
+        }
+
+        private void UnregisterCoopMissionParticipant(string coopGroupName, string peer)
+        {
+            if (IsNullOrWhiteSpace(coopGroupName) || IsNullOrWhiteSpace(peer))
+            {
+                return;
+            }
+
+            lock (_coopMissionLock)
+            {
+                List<CoopMissionParticipant> list;
+                if (!_coopMissionParticipants.TryGetValue(coopGroupName, out list) || list == null)
+                {
+                    return;
+                }
+
+                for (var i = list.Count - 1; i >= 0; i--)
+                {
+                    if (list[i] == null || string.Equals(list[i].Peer, peer, StringComparison.OrdinalIgnoreCase))
+                    {
+                        list.RemoveAt(i);
+                    }
+                }
+
+                if (list.Count == 0)
+                {
+                    _coopMissionParticipants.Remove(coopGroupName);
+
+                    CoopMissionSessionState session;
+                    if (_coopMissionSessions.TryGetValue(coopGroupName, out session) && session != null)
+                    {
+                        _coopMissionSessions.Remove(coopGroupName);
+                        try
+                        {
+                            lock (session.SyncRoot)
+                            {
+                                if (session.Simulation != null)
+                                {
+                                    session.Simulation.Stop();
+                                    session.Simulation = null;
+                                }
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+        }
+
+        private void BroadcastToCoopMissionPeers(string coopGroupName, string senderPeer, byte[] decoded, string note)
+        {
+            if (IsNullOrWhiteSpace(coopGroupName) || decoded == null || decoded.Length == 0)
+            {
+                return;
+            }
+
+            CoopMissionParticipant[] targets = null;
+            lock (_coopMissionLock)
+            {
+                List<CoopMissionParticipant> list;
+                if (!_coopMissionParticipants.TryGetValue(coopGroupName, out list) || list == null || list.Count == 0)
+                {
+                    return;
+                }
+                targets = list.ToArray();
+            }
+
+            for (var i = 0; i < targets.Length; i++)
+            {
+                var t = targets[i];
+                if (t == null || t.Stream == null)
+                {
+                    continue;
+                }
+                if (!IsNullOrWhiteSpace(senderPeer) && string.Equals(t.Peer, senderPeer, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    SendRawFrame(t.Stream, t.Peer, decoded, note);
+                }
+                catch
+                {
+                    // Drop broken streams on next unregister; avoid throwing in main loop.
                 }
             }
         }
@@ -5995,6 +6658,124 @@ namespace Shadowrun.LocalService.Core.Protocols
             return value == null || value.Trim().Length == 0;
         }
 
+        private static bool ContainsGuid(Guid[] values, Guid value)
+        {
+            if (values == null)
+            {
+                return false;
+            }
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (values[i] == value)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static Guid[] OrderGuidsWithLeaderFirst(Guid[] values, Guid leader)
+        {
+            if (values == null || values.Length <= 1)
+            {
+                return values;
+            }
+            if (leader == Guid.Empty)
+            {
+                return values;
+            }
+
+            var leaderIndex = -1;
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (values[i] == leader)
+                {
+                    leaderIndex = i;
+                    break;
+                }
+            }
+            if (leaderIndex <= 0)
+            {
+                // -1 = leader not present; 0 = already first.
+                return values;
+            }
+
+            // Preserve relative order of all other values.
+            var ordered = new Guid[values.Length];
+            ordered[0] = leader;
+            var writeIdx = 1;
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (i == leaderIndex)
+                {
+                    continue;
+                }
+                ordered[writeIdx++] = values[i];
+            }
+            return ordered;
+        }
+
+        private static Guid[] ParseGuidsFromLooseText(string text, int max)
+        {
+            if (IsNullOrWhiteSpace(text) || max <= 0)
+            {
+                return new Guid[0];
+            }
+
+            var list = new List<Guid>();
+            var s = text.Trim();
+
+            // Look for GUID patterns like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+            // The coop member list often looks like: ["<guid>:0", "<guid>:0"]
+            for (var i = 0; i + 36 <= s.Length; i++)
+            {
+                if (s[i + 8] != '-' || s[i + 13] != '-' || s[i + 18] != '-' || s[i + 23] != '-')
+                {
+                    continue;
+                }
+
+                var candidate = s.Substring(i, 36);
+                try
+                {
+                    var g = new Guid(candidate);
+                    var exists = false;
+                    for (var j = 0; j < list.Count; j++)
+                    {
+                        if (list[j] == g)
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists)
+                    {
+                        list.Add(g);
+                        if (list.Count >= max)
+                        {
+                            break;
+                        }
+                    }
+                    i += 35;
+                }
+                catch
+                {
+                    // Not a GUID; keep scanning.
+                }
+            }
+
+            return list.ToArray();
+        }
+
+        private sealed class GuidStringOrdinalComparer : IComparer<Guid>
+        {
+            public static readonly GuidStringOrdinalComparer Instance = new GuidStringOrdinalComparer();
+
+            public int Compare(Guid x, Guid y)
+            {
+                return string.CompareOrdinal(x.ToString(), y.ToString());
+            }
+        }
+
         private static IPAddress ResolveBindAddress(string host)
         {
             if (string.IsNullOrEmpty(host) || host == "0.0.0.0" || host == "+")
@@ -6081,6 +6862,18 @@ namespace Shadowrun.LocalService.Core.Protocols
                 EntityId = entityId;
                 FieldId = fieldId;
                 Data = data;
+            }
+        }
+
+        private sealed class CoopMissionParticipant
+        {
+            public readonly string Peer;
+            public readonly NetworkStream Stream;
+
+            public CoopMissionParticipant(string peer, NetworkStream stream)
+            {
+                Peer = peer;
+                Stream = stream;
             }
         }
     }
