@@ -547,9 +547,12 @@ namespace Shadowrun.LocalService.Core.Persistence
                         SeedStarterItemPackCosmetics(slotObj);
                         SeedAllHairAndBeardOptions(slotObj);
 
-                        // Starting cash for newly created characters.
-                        // (Retail starts with non-zero nuyen; we choose 20,000 for offline.)
-                        slotObj.Nuyen = 20000;
+                        // Starting cash/karma for newly created characters.
+                        // (Retail starts with non-zero values; for offline we use generous defaults.)
+                        slotObj.Nuyen = 900000;
+
+                        // Starting karma for newly created characters.
+                        slotObj.Karma = 500;
                     }
 
                     // Ensure the character creator has enough cosmetic options (hair/beard) even if the career
