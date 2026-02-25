@@ -49,6 +49,7 @@ namespace Shadowrun.LocalService.Core.Simulation
         private readonly IAiDecisionEngine _aiDecisionEngine;
 
         private readonly LocalMissionLootController _lootController;
+        private readonly EncounterActivationTracker _encounterActivationTracker;
 
         private readonly object _lootPreviewLock;
         private readonly List<string> _pendingLootPreviews;
@@ -66,6 +67,7 @@ namespace Shadowrun.LocalService.Core.Simulation
             GameworldController controller,
             TurnObserver turnObserver,
             LocalMissionLootController lootController,
+            EncounterActivationTracker encounterActivationTracker,
             object lootPreviewLock,
             List<string> pendingLootPreviews,
             bool enableAiLogic,
@@ -83,6 +85,7 @@ namespace Shadowrun.LocalService.Core.Simulation
             _controller = controller;
             _turnObserver = turnObserver;
             _lootController = lootController;
+            _encounterActivationTracker = encounterActivationTracker ?? new EncounterActivationTracker();
 
             _lootPreviewLock = lootPreviewLock ?? new object();
             _pendingLootPreviews = pendingLootPreviews ?? new List<string>();
@@ -294,6 +297,12 @@ namespace Shadowrun.LocalService.Core.Simulation
             var turnObserver = new TurnObserver();
             simulation.AddTurnPhaseListener(turnObserver);
 
+            var encounterActivationTracker = new EncounterActivationTracker(logger, peer, gameworldInstance.EntitySystem);
+            if (gameworldInstance.InMissionEventObserver != null)
+            {
+                gameworldInstance.InMissionEventObserver.Add(encounterActivationTracker);
+            }
+
             controller.StartMission();
             controller.StartFirstRound();
 
@@ -377,6 +386,7 @@ namespace Shadowrun.LocalService.Core.Simulation
                 controller,
                 turnObserver,
                 lootController,
+                encounterActivationTracker,
                 lootPreviewLock,
                 pendingLootPreviews,
                 enableAiLogic,

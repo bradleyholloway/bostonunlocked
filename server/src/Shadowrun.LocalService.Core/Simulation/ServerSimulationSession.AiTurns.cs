@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Cliffhanger.SRO.ServerClientCommons.GameLogic.Components;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.CommandProcessing;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.Commands;
@@ -100,7 +101,74 @@ namespace Shadowrun.LocalService.Core.Simulation
                 return false;
             }
 
-            var agent = _turnObserver.CurrentActivatableMembers[0];
+            var activatableMembers = _turnObserver.CurrentActivatableMembers;
+            var agent = activatableMembers[0];
+            var hasCombatEligibleAgent = false;
+            string inactiveSpawnManagerTag = null;
+            for (var memberIndex = 0; memberIndex < activatableMembers.Length; memberIndex++)
+            {
+                var candidate = activatableMembers[memberIndex];
+                string candidateSpawnManagerTag;
+                if (IsAgentEligibleForCombatAction(candidate, out candidateSpawnManagerTag))
+                {
+                    agent = candidate;
+                    hasCombatEligibleAgent = true;
+                    inactiveSpawnManagerTag = null;
+                    break;
+                }
+
+                if (!string.IsNullOrEmpty(candidateSpawnManagerTag)
+                    && _encounterActivationTracker != null
+                    && _encounterActivationTracker.TryEngageSpawnTagFromCurrentPlayerVisibility(candidateSpawnManagerTag))
+                {
+                    agent = candidate;
+                    hasCombatEligibleAgent = true;
+                    inactiveSpawnManagerTag = null;
+                    break;
+                }
+
+                if (inactiveSpawnManagerTag == null && !string.IsNullOrEmpty(candidateSpawnManagerTag))
+                {
+                    inactiveSpawnManagerTag = candidateSpawnManagerTag;
+                }
+            }
+
+            var forceEndTurnForInactiveGroup = !hasCombatEligibleAgent;
+            if (forceEndTurnForInactiveGroup)
+            {
+                var engagedTagSnapshot = _encounterActivationTracker != null
+                    ? _encounterActivationTracker.GetEngagedTagSnapshot()
+                    : new string[0];
+
+                var activatableDiagnostics = activatableMembers
+                    .Select(member =>
+                    {
+                        string memberSpawnManagerTag;
+                        var eligible = IsAgentEligibleForCombatAction(member, out memberSpawnManagerTag);
+                        return new
+                        {
+                            entityId = member != null ? (int?)member.Id : null,
+                            spawnManagerTag = memberSpawnManagerTag,
+                            eligible = eligible,
+                        };
+                    })
+                    .ToArray();
+
+                _logger.Log(new
+                {
+                    ts = RequestLogger.UtcNowIso(),
+                    type = "sim",
+                    peer = _peer,
+                    action = "skip-ai",
+                    status = "no-engaged-activatable-members",
+                    teamId = team.ID,
+                    activatableCount = activatableMembers.Length,
+                    inactiveSpawnManagerTag = inactiveSpawnManagerTag,
+                    engagedTagCount = engagedTagSnapshot.Length,
+                    engagedTags = engagedTagSnapshot,
+                    activatableDiagnostics = activatableDiagnostics,
+                });
+            }
 
             var targetPos = TryGetAgentGridPositionOrDefault(agent);
             var commandName = "AI.EndTeamTurn";
@@ -144,7 +212,12 @@ namespace Shadowrun.LocalService.Core.Simulation
             int? debugProfileRange = null;
             int? debugShotDistanceToTarget = null;
             float? debugShotChanceToHit = null;
-            if (_enableAiLogic && _aiDecisionEngine != null)
+            if (forceEndTurnForInactiveGroup)
+            {
+                decisionNote = "inactive-group";
+                debugStage = "inactive-group";
+            }
+            else if (_enableAiLogic && _aiDecisionEngine != null)
             {
                 try
                 {
@@ -389,6 +462,8 @@ namespace Shadowrun.LocalService.Core.Simulation
                         debugProfileRange = debugProfileRange,
                         debugShotDistanceToTarget = debugShotDistanceToTarget,
                         debugShotChanceToHit = debugShotChanceToHit,
+                        inactiveSpawnManagerTag = inactiveSpawnManagerTag,
+                        forceEndTurnForInactiveGroup = forceEndTurnForInactiveGroup,
                         debugReasoning = debugReasoning,
                         command = commandName,
                         targetX = targetPos.X,
@@ -515,6 +590,29 @@ namespace Shadowrun.LocalService.Core.Simulation
                 skillToUse,
                 seeds);
             return true;
+        }
+
+        private bool IsAgentEligibleForCombatAction(Entity agent, out string spawnManagerTag)
+        {
+            spawnManagerTag = null;
+            if (_encounterActivationTracker == null || _gameworld == null || _gameworld.EntitySystem == null)
+            {
+                return true;
+            }
+
+            CharacterSpawnInfoComponent spawnInfo;
+            if (!_gameworld.EntitySystem.TryGetComponent<CharacterSpawnInfoComponent>(agent, out spawnInfo))
+            {
+                return true;
+            }
+
+            if (spawnInfo == null || string.IsNullOrEmpty(spawnInfo.SpawnManagerTag))
+            {
+                return true;
+            }
+
+            spawnManagerTag = spawnInfo.SpawnManagerTag;
+            return _encounterActivationTracker.IsGroupEngaged(spawnManagerTag);
         }
 
         private static string BuildAiDecisionReasoning(

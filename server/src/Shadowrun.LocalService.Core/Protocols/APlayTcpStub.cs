@@ -4204,10 +4204,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 slot.MainCampaignCurrentChapter = 0;
 
                                                 // Starting cash/karma for a brand new runner.
-                                                slot.Nuyen = 900000;
+                                                slot.Nuyen = 0;
 
                                                 // Starting karma for a brand new runner.
-                                                slot.Karma = 500;
+                                                slot.Karma = 0;
 
                                                 // Reset main campaign progression for a brand new runner.
                                                 slot.MainCampaignMissionStates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);

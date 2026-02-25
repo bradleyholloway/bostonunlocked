@@ -134,6 +134,7 @@
     <Compile Include="Protocols\PhotonProxyTcpStub.Operations.cs" />
     <Compile Include="RequestLogger.cs" />
     <Compile Include="Simulation\LocalMissionLootController.cs" />
+    <Compile Include="Simulation\EncounterActivationTracker.cs" />
     <Compile Include="Simulation\NullMetagameplayrelevantChangeObserver.cs" />
     <Compile Include="Simulation\ServerSimulationSession.cs" />
     <Compile Include="Simulation\ServerSimulationSession.AiTurns.cs" />
