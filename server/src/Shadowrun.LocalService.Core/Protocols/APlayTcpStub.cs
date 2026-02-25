@@ -1574,6 +1574,7 @@ namespace Shadowrun.LocalService.Core.Protocols
         private readonly ISessionIdentityMap _sessionIdentityMap;
         private readonly CareerInfoGenerator _careerInfoGenerator;
         private readonly MatchConfigurationGenerator _matchConfigurationGenerator;
+        private readonly CharacterStatePushBroker _characterStatePushBroker;
 
         // APlay DirectSystem messages include an 8-byte message number the client may use for ordering/dedup.
         // For MetaGameplay pushes we must keep these monotonic even if the client repeats a request with a lower MsgNo.
@@ -1666,16 +1667,21 @@ namespace Shadowrun.LocalService.Core.Protocols
         }
 
         public APlayTcpStub(LocalServiceOptions options, RequestLogger logger)
-            : this(options, logger, new LocalUserStore(options, logger), null)
+            : this(options, logger, new LocalUserStore(options, logger), null, null)
         {
         }
 
         public APlayTcpStub(LocalServiceOptions options, RequestLogger logger, LocalUserStore userStore)
-            : this(options, logger, userStore, null)
+            : this(options, logger, userStore, null, null)
         {
         }
 
         public APlayTcpStub(LocalServiceOptions options, RequestLogger logger, LocalUserStore userStore, ISessionIdentityMap sessionIdentityMap)
+            : this(options, logger, userStore, sessionIdentityMap, null)
+        {
+        }
+
+        public APlayTcpStub(LocalServiceOptions options, RequestLogger logger, LocalUserStore userStore, ISessionIdentityMap sessionIdentityMap, CharacterStatePushBroker characterStatePushBroker)
         {
             _options = options;
             _logger = logger;
@@ -1683,6 +1689,7 @@ namespace Shadowrun.LocalService.Core.Protocols
             _sessionIdentityMap = sessionIdentityMap;
             _careerInfoGenerator = new CareerInfoGenerator(logger);
             _matchConfigurationGenerator = new MatchConfigurationGenerator(logger);
+            _characterStatePushBroker = characterStatePushBroker ?? CharacterStatePushBroker.Shared;
         }
 
         private ulong AllocateGameClientEntityId()
@@ -1730,6 +1737,133 @@ namespace Shadowrun.LocalService.Core.Protocols
             lock (_identityEntityIdLock)
             {
                 return _gameClientEntityIdByIdentity.TryGetValue(identityGuid, out gameClientEntityId) && gameClientEntityId != 0UL;
+            }
+        }
+
+        private ulong ReserveMetaGameplayMsgNos(int count)
+        {
+            if (count <= 0)
+            {
+                count = 1;
+            }
+
+            while (true)
+            {
+                var observed = Interlocked.Read(ref _metaGameplayOutMsgNoHighWatermark);
+                var observedU = observed > 0 ? (ulong)observed : 0UL;
+                var first = observedU + 1UL;
+                if (first == 0UL)
+                {
+                    first = 1UL;
+                }
+
+                var last = first + (ulong)count - 1UL;
+                if (Interlocked.CompareExchange(ref _metaGameplayOutMsgNoHighWatermark, (long)last, observed) == observed)
+                {
+                    return first;
+                }
+            }
+        }
+
+        private void TryFlushPendingCharacterStatePushes(Guid identityGuid, string identityHash, int activeCareerIndex, string peer, NetworkStream stream)
+        {
+            if (_characterStatePushBroker == null || _userStore == null || _careerInfoGenerator == null)
+            {
+                return;
+            }
+            if (identityGuid == Guid.Empty || IsNullOrWhiteSpace(identityHash) || stream == null)
+            {
+                return;
+            }
+
+            CharacterStatePushPaths paths;
+            if (!_characterStatePushBroker.TryDequeue(identityGuid, out paths) || paths == CharacterStatePushPaths.None)
+            {
+                return;
+            }
+
+            try
+            {
+                var slot = _userStore.GetOrCreateCareer(identityHash, activeCareerIndex, false);
+                if (slot == null)
+                {
+                    return;
+                }
+
+                var sendCount = 0;
+                if ((paths & CharacterStatePushPaths.CareerSummaries) != 0) sendCount++;
+                if ((paths & CharacterStatePushPaths.Wallet) != 0) sendCount++;
+                if ((paths & CharacterStatePushPaths.Inventory) != 0) sendCount++;
+                if ((paths & CharacterStatePushPaths.MetaSnapshot) != 0) sendCount++;
+
+                if (sendCount <= 0)
+                {
+                    return;
+                }
+
+                var msgNo = ReserveMetaGameplayMsgNos(sendCount);
+
+                if ((paths & CharacterStatePushPaths.CareerSummaries) != 0)
+                {
+                    var updatePayload = BuildUtf16StringPayload(BuildCareerSummaryJson(_userStore.GetCareers(identityHash)));
+                    var updateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 2, 16, updatePayload), msgNo++);
+                    SendRawFrame(stream, peer, PrefixLength(updateCore), "sent AccountCommunicationObject UpdateCareerSummaries (queued character-state push)");
+                }
+
+                if ((paths & CharacterStatePushPaths.Wallet) != 0)
+                {
+                    var serializedWallet = SerializeWalletForSlot(slot);
+                    var walletChangedPayload = BuildUtf16StringPayload(serializedWallet);
+                    var walletChangedCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 32, walletChangedPayload), msgNo++);
+                    SendRawFrame(stream, peer, PrefixLength(walletChangedCore), "sent MetaGameplayCommunicationObject WalletChanged (queued character-state push)");
+                }
+
+                if ((paths & CharacterStatePushPaths.Inventory) != 0)
+                {
+                    var serializedInventory = SerializeInventoryFromSlot(slot);
+                    var emptyShopChanges = InventorySerializer.SerializeShopItemChanges(new ShopItemChanges
+                    {
+                        Failed = false,
+                        TotalNuyenChange = 0,
+                        AppliedChanges = new ItemChange[0],
+                        NotAppliedChanges = new ItemChange[0],
+                    });
+
+                    var inventoryChangedPayload = BuildUtf16StringPayload(serializedInventory, emptyShopChanges);
+                    var inventoryChangedCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 31, inventoryChangedPayload), msgNo++);
+                    SendRawFrame(stream, peer, PrefixLength(inventoryChangedCore), "sent MetaGameplayCommunicationObject InventoryChanged (queued character-state push)");
+                }
+
+                if ((paths & CharacterStatePushPaths.MetaSnapshot) != 0)
+                {
+                    var zippedCareerInfo = _careerInfoGenerator.GetZippedCareerInfo(identityGuid, activeCareerIndex, slot);
+                    var metaSnapshotPayload = BuildUtf16StringPayload(zippedCareerInfo);
+                    var metaSnapshotCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 26, metaSnapshotPayload), msgNo++);
+                    SendRawFrame(stream, peer, PrefixLength(metaSnapshotCore), "sent MetaGameplayCommunicationObject SendMetagameplayDataSnapshotToClient (queued character-state push)");
+                }
+
+                _logger.LogAdmin(new
+                {
+                    ts = RequestLogger.UtcNowIso(),
+                    type = "character-state-push",
+                    action = "flushed",
+                    identityGuid = identityGuid,
+                    careerIndex = activeCareerIndex,
+                    paths = paths.ToString(),
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogAdmin(new
+                {
+                    ts = RequestLogger.UtcNowIso(),
+                    type = "character-state-push",
+                    action = "flush-failed",
+                    identityGuid = identityGuid,
+                    careerIndex = activeCareerIndex,
+                    paths = paths.ToString(),
+                    error = ex.Message,
+                });
             }
         }
 
@@ -2808,15 +2942,6 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 currentCoopGroupName = coopGroupName;
                                 RegisterCoopMissionParticipant(coopGroupName, peer, stream);
 
-                                // If the mission was already completed locally, cancel like we do for DirectStart story missions.
-                                if (completedStoryMissions.Contains(mapName))
-                                {
-                                    var nudgeMsgNoBase = direct.Value.MsgNo + 250;
-                                    var cancelledCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 24, new byte[0]), nudgeMsgNoBase);
-                                    SendRawFrame(stream, peer, PrefixLength(cancelledCore), "sent MetaGameplayCommunicationObject StartMissionCancelled (coop mission already completed)");
-                                    continue;
-                                }
-
                                 var requestMsgNoBase = direct.Value.MsgNo + 250;
 
                                 if (!sentMissionEntityIntros)
@@ -2940,13 +3065,31 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 // If each TCP connection has its own sim, neither side will ever observe the other
                                 // player exhausting actions, so the team never ends and AI turns never start.
                                 CoopMissionSessionState coopSession;
+                                var cancelCompletedCoopStart = false;
                                 lock (_coopMissionLock)
                                 {
                                     if (!_coopMissionSessions.TryGetValue(coopGroupName, out coopSession) || coopSession == null)
                                     {
-                                        coopSession = new CoopMissionSessionState(coopGroupName);
-                                        _coopMissionSessions[coopGroupName] = coopSession;
+                                        // Only cancel for completed maps when we'd have to create a brand-new coop session.
+                                        // If a session already exists, late/jittered duplicate starts should reuse it instead
+                                        // of kicking one player back to hub.
+                                        if (completedStoryMissions.Contains(mapName))
+                                        {
+                                            cancelCompletedCoopStart = true;
+                                        }
+                                        else
+                                        {
+                                            coopSession = new CoopMissionSessionState(coopGroupName);
+                                            _coopMissionSessions[coopGroupName] = coopSession;
+                                        }
                                     }
+                                }
+
+                                if (cancelCompletedCoopStart)
+                                {
+                                    var cancelledCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 24, new byte[0]), requestMsgNoBase);
+                                    SendRawFrame(stream, peer, PrefixLength(cancelledCore), "sent MetaGameplayCommunicationObject StartMissionCancelled (coop mission already completed)");
+                                    continue;
                                 }
 
                                 simulationSessionSync = coopSession.SyncRoot;
@@ -4524,6 +4667,16 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             }
                                         }
 
+                                        // CONTRACT (SetStoryMissionStateMessage response sequence):
+                                        // 1) StoryprogressChanged(MissionStateChange) MUST be sent first so mission UI state changes immediately.
+                                        // 2) If chapter did not advance but hub NPC/marker refresh is expected, send a same-index
+                                        //    StoryprogressChanged(ChapterChange) nudge so client HubStoryProgressObserver raises hub-name changed
+                                        //    and LocalHubInstanceController queues RequestCurrentStorylineHub().
+                                        // 3) SendMetagameplayDataSnapshotToClient so StorylineController rebuilds from authoritative state.
+                                        // 4) Optional hub/creation pushes are best-effort; unsolicited pushes can be ignored by client when
+                                        //    no hub request is pending, but they remain useful as low-latency nudges.
+                                        // 5) Preserve strictly increasing msgNo ordering for every outbound metagameplay event.
+
                                         // CRITICAL: send MissionStateChange immediately so UI reacts (quest markers, claim option, etc).
                                         try
                                         {
@@ -4600,15 +4753,37 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                         // Retail-like: advance chapter once current chapter's required missions are fully completed/claimed.
                                         // If the advancement triggers, reserve msgNos to avoid collisions with our own pushes.
+                                        var chapterAdvanced = false;
                                         if (slotForStoryRewards != null)
                                         {
                                             try
                                             {
-                                                var advanced = TryAdvanceMainCampaignIfEligible(activeIdentityHash, slotForStoryRewards, peer, stream, "Main Campaign", outMsgNo, ref cachedHubStatePayload, cachedCreationInfoPayload, true);
-                                                if (advanced)
+                                                chapterAdvanced = TryAdvanceMainCampaignIfEligible(activeIdentityHash, slotForStoryRewards, peer, stream, "Main Campaign", outMsgNo, ref cachedHubStatePayload, cachedCreationInfoPayload, true);
+                                                if (chapterAdvanced)
                                                 {
                                                     outMsgNo = outMsgNo + 2;
                                                 }
+                                            }
+                                            catch
+                                            {
+                                            }
+                                        }
+
+                                        // If mission progression changed within the current chapter, force the existing client pathway
+                                        // that queues RequestCurrentStorylineHub() by emitting a same-index ChapterChange.
+                                        // This avoids relying solely on unsolicited hub pushes (which can be ignored without pending request).
+                                        if (!chapterAdvanced
+                                            && slotForStoryRewards != null
+                                            && (parsedTarget == StoryMissionstate.ReadyToPlay || parsedTarget == StoryMissionstate.Completed)
+                                            && slotForStoryRewards.MainCampaignCurrentChapter >= 0)
+                                        {
+                                            try
+                                            {
+                                                var sameChapterIndex = slotForStoryRewards.MainCampaignCurrentChapter;
+                                                var chapterNudgeJson = "{\"TypeName\":\"Cliffhanger.SRO.ServerClientCommons.Metagameplay.ChapterChange, Cliffhanger.SRO.ServerClientCommons\",\"Storyline\":\"Main Campaign\",\"NewChapterIndex\":" + sameChapterIndex.ToString(CultureInfo.InvariantCulture) + "}";
+                                                var chapterNudgePayload = BuildUtf16StringPayload(chapterNudgeJson);
+                                                var chapterNudgeCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 36, chapterNudgePayload), outMsgNo++);
+                                                SendRawFrame(stream, peer, PrefixLength(chapterNudgeCore), "sent MetaGameplayCommunicationObject StoryprogressChanged (ChapterChange " + sameChapterIndex.ToString(CultureInfo.InvariantCulture) + ") nudge after SetStoryMissionStateMessage");
                                             }
                                             catch
                                             {
@@ -5115,19 +5290,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 {
                                                     // Retail-like: after a mission finishes, it becomes ReadyToReceiveRewards.
                                                     // The player (in hub) then redeems rewards, which moves it to Completed.
-                                                    //
-                                                    // Special-case the prologue: if we leave it at ReadyToReceiveRewards,
-                                                    // the client's MandatoryMissionStarter can still consider it mandatory
-                                                    // and will try to immediately start it again during mission shutdown.
-                                                    // Our server-side StartMissionCancelled response then surfaces as
-                                                    // "missionController.ServerAbortedMission".
-                                                    var postMissionState = StoryMissionstate.ReadyToReceiveRewards;
-                                                    if (string.Equals(completedMapName, "1_010_Prologue", StringComparison.OrdinalIgnoreCase))
-                                                    {
-                                                        postMissionState = StoryMissionstate.Completed;
-                                                    }
-
-                                                    progressSlot.MainCampaignMissionStates[completedMapName] = postMissionState.ToString();
+                                                    progressSlot.MainCampaignMissionStates[completedMapName] = StoryMissionstate.ReadyToReceiveRewards.ToString();
                                                 }
                                                 _userStore.UpsertCareer(activeIdentityHash, progressSlot);
 
@@ -5887,6 +6050,8 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 }
                             }
                         }
+
+                        TryFlushPendingCharacterStatePushes(activeIdentityGuid, activeIdentityHash, activeCareerIndex, peer, stream);
 
                         var chunk = ReadChunk(stream);
                         if (chunk.Length == 0)

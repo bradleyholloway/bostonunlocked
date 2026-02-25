@@ -25,8 +25,8 @@ namespace Shadowrun.LocalService.Host
 				// Ignore.
 			}
 			var logger = options.DisableFileLogs
-				? new RequestLogger(null, null, null)
-				: new RequestLogger(options.RequestLogPath, options.RequestLowLogPath, options.AiLogPath);
+				? new RequestLogger(null, null, null, null)
+				: new RequestLogger(options.RequestLogPath, options.RequestLowLogPath, options.AiLogPath, options.AdminLogPath);
 			logger.Reset();
 			logger.Log(new
 			{
@@ -47,13 +47,16 @@ namespace Shadowrun.LocalService.Host
 				Console.WriteLine("[localservice-cs] request log: (disabled)");
 				Console.WriteLine("[localservice-cs] request log (low): (disabled)");
 				Console.WriteLine("[localservice-cs] request log (ai): (disabled)");
+				Console.WriteLine("[localservice-cs] request log (admin): (disabled)");
 			}
 			else
 			{
 				Console.WriteLine("[localservice-cs] request log: {0}", options.RequestLogPath);
 				Console.WriteLine("[localservice-cs] request log (low): {0}", options.RequestLowLogPath);
 				Console.WriteLine("[localservice-cs] request log (ai): {0}", options.AiLogPath);
+				Console.WriteLine("[localservice-cs] request log (admin): {0}", options.AdminLogPath);
 			}
+			Console.WriteLine("[localservice-cs] chat admin config: {0}", options.ChatAdminConfigPath);
 
 			var stopEvent = new ManualResetEvent(false);
 			Console.CancelKeyPress += delegate (object sender, ConsoleCancelEventArgs eventArgs)
@@ -64,9 +67,10 @@ namespace Shadowrun.LocalService.Host
 
 			var userStore = new LocalUserStore(options, logger);
 			var sessionIdentityMap = new ExpiringSessionIdentityMap();
+			var characterStatePushBroker = new CharacterStatePushBroker();
 			var httpServer = new HttpStubServer(options, logger, userStore, sessionIdentityMap, null);
-			var aplayStub = new APlayTcpStub(options, logger, userStore, sessionIdentityMap);
-			var photonStub = new PhotonProxyTcpStub(options, logger, userStore, sessionIdentityMap);
+			var aplayStub = new APlayTcpStub(options, logger, userStore, sessionIdentityMap, characterStatePushBroker);
+			var photonStub = new PhotonProxyTcpStub(options, logger, userStore, sessionIdentityMap, characterStatePushBroker);
 
 			Exception httpError = null;
 			Exception aplayError = null;
@@ -241,6 +245,12 @@ namespace Shadowrun.LocalService.Host
 					{
 						photonPort = parsedPhotonPort;
 					}
+					continue;
+				}
+				if (string.Equals(arg, "--chat-admins", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+				{
+					// Deprecated: admin accounts are now loaded from options.ChatAdminConfigPath.
+					i++;
 					continue;
 				}
 			}

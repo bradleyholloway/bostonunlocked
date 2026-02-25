@@ -456,6 +456,27 @@ namespace Shadowrun.LocalService.Core.Protocols
                 }
             }
 
+            public void SendTextMessageToAccount(Guid toAccountId, string channelName, Guid senderAccountId, string text)
+            {
+                if (toAccountId == Guid.Empty)
+                {
+                    return;
+                }
+
+                var effectiveSender = senderAccountId != Guid.Empty ? senderAccountId : toAccountId;
+                var effectiveChannel = !string.IsNullOrEmpty(channelName) ? channelName : "Global";
+
+                var payload = new TextMessageEventParameters
+                {
+                    Sender = effectiveSender,
+                    Text = text ?? string.Empty,
+                    ChannelName = effectiveChannel,
+                    ServerTimestamp = DateTime.UtcNow,
+                };
+
+                SendEventToAccount(toAccountId, payload);
+            }
+
             private void BroadcastChannelParticipantChanged(string channelName, Guid participant, bool added)
             {
                 if (string.IsNullOrEmpty(channelName) || participant == Guid.Empty)

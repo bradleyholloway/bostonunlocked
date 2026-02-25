@@ -31,6 +31,7 @@ public sealed class LocalServiceOptions
 
         // Keep persistence outside build output by default.
         _dataDir = TryGetDefaultPersistentDataDir();
+        ChatAdminConfigPath = Path.Combine(_dataDir, "chat-admins.json");
     }
 
     public string Host { get; set; }
@@ -41,6 +42,7 @@ public sealed class LocalServiceOptions
 
     public string GameRootDir { get; set; }
     public string StreamingAssetsDir { get; set; }
+    public string ChatAdminConfigPath { get; set; }
 
     /// <summary>
     /// When true, the server simulation will attempt to run the local AI decision engine
@@ -121,6 +123,7 @@ public sealed class LocalServiceOptions
     public string RequestLogPath { get { return Path.Combine(LogDir, "requests-csharp.log"); } }
     public string RequestLowLogPath { get { return Path.Combine(LogDir, "requests-csharp-low.log"); } }
     public string AiLogPath { get { return Path.Combine(LogDir, "requests-csharp-ai.log"); } }
+    public string AdminLogPath { get { return Path.Combine(LogDir, "requests-csharp-admin.log"); } }
 
     private string TryGetPortableSubdir(string name)
     {

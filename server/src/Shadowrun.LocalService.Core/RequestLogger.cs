@@ -11,6 +11,7 @@ public sealed class RequestLogger
     private readonly string _path;
     private readonly string _lowPath;
     private readonly string _aiPath;
+    private readonly string _adminPath;
     private readonly bool _fileLoggingEnabled;
     private readonly object _writeLock = new object();
 
@@ -20,6 +21,11 @@ public sealed class RequestLogger
     }
 
     public RequestLogger(string path, string lowPath, string aiPath)
+        : this(path, lowPath, aiPath, null)
+    {
+    }
+
+    public RequestLogger(string path, string lowPath, string aiPath, string adminPath)
     {
         if (IsNullOrWhiteSpace(path))
         {
@@ -27,6 +33,7 @@ public sealed class RequestLogger
             _path = null;
             _lowPath = null;
             _aiPath = null;
+            _adminPath = null;
             _fileLoggingEnabled = false;
             return;
         }
@@ -34,6 +41,7 @@ public sealed class RequestLogger
         _path = path;
         _lowPath = IsNullOrWhiteSpace(lowPath) ? null : lowPath;
         _aiPath = IsNullOrWhiteSpace(aiPath) ? null : aiPath;
+        _adminPath = IsNullOrWhiteSpace(adminPath) ? null : adminPath;
         _fileLoggingEnabled = true;
 
         var parent = Path.GetDirectoryName(_path);
@@ -59,6 +67,15 @@ public sealed class RequestLogger
                 Directory.CreateDirectory(aiParent);
             }
         }
+
+        if (_adminPath != null)
+        {
+            var adminParent = Path.GetDirectoryName(_adminPath);
+            if (!IsNullOrWhiteSpace(adminParent))
+            {
+                Directory.CreateDirectory(adminParent);
+            }
+        }
     }
 
     public void Reset()
@@ -79,6 +96,11 @@ public sealed class RequestLogger
             if (_aiPath != null)
             {
                 File.WriteAllText(_aiPath, string.Empty);
+            }
+
+            if (_adminPath != null)
+            {
+                File.WriteAllText(_adminPath, string.Empty);
             }
         }
     }
@@ -134,6 +156,26 @@ public sealed class RequestLogger
         lock (_writeLock)
         {
             File.AppendAllText(_aiPath, json + Environment.NewLine);
+        }
+    }
+
+    public void LogAdmin(object payload)
+    {
+        if (!_fileLoggingEnabled)
+        {
+            return;
+        }
+
+        if (_adminPath == null)
+        {
+            Log(payload);
+            return;
+        }
+
+        var json = Json.Serialize(payload);
+        lock (_writeLock)
+        {
+            File.AppendAllText(_adminPath, json + Environment.NewLine);
         }
     }
 
