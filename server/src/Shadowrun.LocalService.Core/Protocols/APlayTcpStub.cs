@@ -58,6 +58,7 @@ namespace Shadowrun.LocalService.Core.Protocols
 
         private const string DefaultHubId = "Act01_HUB_02";
         private const string FallbackSerializedHubState = "CwAAAEgAVQBCAF8AcwBjAGUAbgBlAF8AMQALAAAASABVAEIAXwBzAGMAZQBuAGUAXwAxAAA=";
+        private static long _hubInstanceSequence;
         private static readonly object HenchmanCollectionCacheLock = new object();
         private static string CachedSerializedHenchmanCollection;
         private static DateTime CachedSerializedHenchmanCollectionLastWriteUtc;
@@ -1253,7 +1254,27 @@ namespace Shadowrun.LocalService.Core.Protocols
             return item;
         }
 
+        private static string BuildProgressionHubInstanceId(string hubName)
+        {
+            var canonicalHubName = !IsNullOrWhiteSpace(hubName) ? hubName : DefaultHubId;
+            var sequence = Interlocked.Increment(ref _hubInstanceSequence);
+            return canonicalHubName + "#" + sequence.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static byte[] BuildHubStatePayloadForSlot(CareerSlot slot, string characterIdentifier, bool forceNewHubInstanceId)
+        {
+            var hubName = slot != null && !IsNullOrWhiteSpace(slot.HubId) ? slot.HubId : DefaultHubId;
+            var hubId = forceNewHubInstanceId ? BuildProgressionHubInstanceId(hubName) : hubName;
+            var name = slot != null ? slot.CharacterName : null;
+            return BuildMetaHubPushPayload(4, SerializeHubStateOrFallback(hubId, characterIdentifier, name, slot, hubName));
+        }
+
         private static string SerializeHubStateOrFallback(string hubId, string characterIdentifier, string characterName, CareerSlot slot)
+        {
+            return SerializeHubStateOrFallback(hubId, characterIdentifier, characterName, slot, null);
+        }
+
+        private static string SerializeHubStateOrFallback(string hubId, string characterIdentifier, string characterName, CareerSlot slot, string hubNameOverride)
         {
             if (IsNullOrWhiteSpace(hubId))
             {
@@ -1262,7 +1283,7 @@ namespace Shadowrun.LocalService.Core.Protocols
 
             try
             {
-                var state = new HubState { HubId = hubId, Name = hubId };
+                var state = new HubState { HubId = hubId, Name = !IsNullOrWhiteSpace(hubNameOverride) ? hubNameOverride : hubId };
 
                 if (!IsNullOrWhiteSpace(characterIdentifier))
                 {
@@ -1993,6 +2014,154 @@ namespace Shadowrun.LocalService.Core.Protocols
             }
         }
 
+        private bool TryMarkCurrentChapterDialogNpcsAsInteracted(CareerSlot slot, string storylineName)
+        {
+            var npcIds = GetCurrentChapterDialogNpcIds(slot, storylineName);
+            if (npcIds == null || npcIds.Count == 0)
+            {
+                return false;
+            }
+
+            if (slot.MainCampaignInteractedNpcs == null)
+            {
+                slot.MainCampaignInteractedNpcs = new List<string>();
+            }
+
+            var changed = false;
+            for (var i = 0; i < npcIds.Count; i++)
+            {
+                var npcId = npcIds[i];
+                if (IsNullOrWhiteSpace(npcId))
+                {
+                    continue;
+                }
+
+                if (!slot.MainCampaignInteractedNpcs.Contains(npcId))
+                {
+                    slot.MainCampaignInteractedNpcs.Add(npcId);
+                    changed = true;
+                }
+            }
+
+            return changed;
+        }
+
+        private List<string> GetCurrentChapterDialogNpcIds(CareerSlot slot, string storylineName)
+        {
+            var npcIds = new List<string>();
+            if (slot == null || IsNullOrWhiteSpace(storylineName))
+            {
+                return npcIds;
+            }
+
+            try
+            {
+                StorylineInfo storyline;
+                if (!TryGetStoryline(storylineName, out storyline) || storyline == null || storyline.Chapters == null || storyline.Chapters.Count == 0)
+                {
+                    return npcIds;
+                }
+
+                var currentIndex = slot.MainCampaignCurrentChapter;
+                if (currentIndex < 0)
+                {
+                    currentIndex = 0;
+                }
+                if (currentIndex >= storyline.Chapters.Count)
+                {
+                    currentIndex = storyline.Chapters.Count - 1;
+                }
+
+                var chapter = storyline.Chapters[currentIndex];
+                if (chapter == null || chapter.DialogNpcIds == null || chapter.DialogNpcIds.Count == 0)
+                {
+                    return npcIds;
+                }
+
+                for (var i = 0; i < chapter.DialogNpcIds.Count; i++)
+                {
+                    var npcId = chapter.DialogNpcIds[i];
+                    if (IsNullOrWhiteSpace(npcId))
+                    {
+                        continue;
+                    }
+
+                    if (!npcIds.Contains(npcId))
+                    {
+                        npcIds.Add(npcId);
+                    }
+                }
+            }
+            catch
+            {
+                npcIds.Clear();
+            }
+
+            return npcIds;
+        }
+
+        private bool TryGetRefreshTriggerChapterIndexWithDifferentHub(string storylineName, int currentIndex, string currentHub, out int triggerIndex)
+        {
+            triggerIndex = -1;
+            try
+            {
+                StorylineInfo storyline;
+                if (!TryGetStoryline(storylineName, out storyline) || storyline == null || storyline.Chapters == null || storyline.Chapters.Count == 0)
+                {
+                    return false;
+                }
+
+                var boundedCurrent = currentIndex;
+                if (boundedCurrent < 0)
+                {
+                    boundedCurrent = 0;
+                }
+                if (boundedCurrent >= storyline.Chapters.Count)
+                {
+                    boundedCurrent = storyline.Chapters.Count - 1;
+                }
+
+                var currentHubResolved = currentHub;
+                if (IsNullOrWhiteSpace(currentHubResolved))
+                {
+                    var currentChapter = storyline.Chapters[boundedCurrent];
+                    if (currentChapter != null && !IsNullOrWhiteSpace(currentChapter.Hub))
+                    {
+                        currentHubResolved = currentChapter.Hub;
+                    }
+                }
+
+                for (var i = 0; i < storyline.Chapters.Count; i++)
+                {
+                    if (i == boundedCurrent)
+                    {
+                        continue;
+                    }
+
+                    var chapter = storyline.Chapters[i];
+                    if (chapter == null || IsNullOrWhiteSpace(chapter.Hub))
+                    {
+                        continue;
+                    }
+
+                    if (!IsNullOrWhiteSpace(currentHubResolved) && string.Equals(chapter.Hub, currentHubResolved, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    triggerIndex = i;
+                    return true;
+                }
+
+                return false;
+            }
+            catch
+            {
+                triggerIndex = -1;
+                return false;
+            }
+        }
+
         private bool TryAdvanceMainCampaignIfEligible(string identityHash, CareerSlot slot, string peer, NetworkStream stream, string storylineName, ulong msgNoBase, ref byte[] cachedHubStatePayload, byte[] cachedCreationInfoPayload, bool nudgeClient)
         {
             if (slot == null)
@@ -2085,7 +2254,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                 var characterIdentifier = !IsNullOrWhiteSpace(slot.CharacterIdentifier)
                     ? slot.CharacterIdentifier
                     : (Guid.NewGuid().ToString() + ":" + slot.Index.ToString(CultureInfo.InvariantCulture));
-                cachedHubStatePayload = BuildMetaHubPushPayload(4, SerializeHubStateOrFallback(hubId, characterIdentifier, slot.CharacterName, slot));
+                cachedHubStatePayload = BuildHubStatePayloadForSlot(slot, characterIdentifier, true);
             }
             catch
             {
@@ -2400,6 +2569,32 @@ namespace Shadowrun.LocalService.Core.Protocols
                                 {
                                     payloadStrings.Add(extracted);
                                 }
+                            }
+
+                            var isHubEntityCall = shared.Value.ApMsgId == 1
+                                && shared.Value.EntityId == HubEntityId;
+                            if (isHubEntityCall)
+                            {
+                                var payloadPreview = payloadStrings.Count > 0 && payloadStrings[0] != null
+                                    ? payloadStrings[0]
+                                    : string.Empty;
+                                if (payloadPreview.Length > 320)
+                                {
+                                    payloadPreview = payloadPreview.Substring(0, 320);
+                                }
+
+                                _logger.Log(new
+                                {
+                                    ts = RequestLogger.UtcNowIso(),
+                                    type = "hub-entity-call",
+                                    peer = peer,
+                                    apMsgId = shared.Value.ApMsgId,
+                                    entityId = shared.Value.EntityId,
+                                    fieldId = shared.Value.FieldId,
+                                    dataBytes = shared.Value.Data != null ? shared.Value.Data.Length : 0,
+                                    payloadCount = payloadStrings.Count,
+                                    payloadPreview = payloadPreview,
+                                });
                             }
 
                             var isRegularConnect = shared.Value.ApMsgId == 1
@@ -4490,7 +4685,6 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         var shouldGrantStoryRewards = false;
                                         StoryMissionstate previousState = StoryMissionstate.Available;
                                         CareerSlot slotForStoryRewards = null;
-
                                         // Persist the requested state so it survives restarts.
                                         if (_userStore != null)
                                         {
@@ -4527,6 +4721,14 @@ namespace Shadowrun.LocalService.Core.Protocols
 
                                                     // Store canonical enum names; our snapshot generator parses these.
                                                     slot.MainCampaignMissionStates[missionName] = parsedTarget.ToString();
+
+                                                    // Fallback for client flows that do not emit InteractedWithNpcMessage:
+                                                    // when a chapter mission transitions to playable/completed, mark current chapter
+                                                    // dialog NPCs as interacted so repeat dialog/"new" markers are cleared.
+                                                    if (parsedTarget == StoryMissionstate.ReadyToPlay || parsedTarget == StoryMissionstate.Completed)
+                                                    {
+                                                        TryMarkCurrentChapterDialogNpcsAsInteracted(slot, "Main Campaign");
+                                                    }
 
                                                     _userStore.UpsertCareer(activeIdentityHash, slot);
                                                 }
@@ -4668,14 +4870,12 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         }
 
                                         // CONTRACT (SetStoryMissionStateMessage response sequence):
-                                        // 1) StoryprogressChanged(MissionStateChange) MUST be sent first so mission UI state changes immediately.
-                                        // 2) If chapter did not advance but hub NPC/marker refresh is expected, send a same-index
-                                        //    StoryprogressChanged(ChapterChange) nudge so client HubStoryProgressObserver raises hub-name changed
-                                        //    and LocalHubInstanceController queues RequestCurrentStorylineHub().
-                                        // 3) SendMetagameplayDataSnapshotToClient so StorylineController rebuilds from authoritative state.
-                                        // 4) Optional hub/creation pushes are best-effort; unsolicited pushes can be ignored by client when
-                                        //    no hub request is pending, but they remain useful as low-latency nudges.
-                                        // 5) Preserve strictly increasing msgNo ordering for every outbound metagameplay event.
+                                        // 1) Apply authoritative mission/chapter/NPC-interaction state first.
+                                        // 2) StoryprogressChanged(MissionStateChange) MUST be sent first so mission UI updates immediately.
+                                        // 3) StoryprogressChanged(ChapterChange) is sent only when chapter truly advances.
+                                        // 4) SendMetagameplayDataSnapshotToClient from final authoritative state.
+                                        // 5) Hub communication object is sent in response to RequestCurrentStorylineHubMessage/RequestStoryHubFor.
+                                        // 6) Preserve strictly increasing msgNo ordering for every outbound metagameplay event.
 
                                         // CRITICAL: send MissionStateChange immediately so UI reacts (quest markers, claim option, etc).
                                         try
@@ -4758,10 +4958,10 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         {
                                             try
                                             {
-                                                chapterAdvanced = TryAdvanceMainCampaignIfEligible(activeIdentityHash, slotForStoryRewards, peer, stream, "Main Campaign", outMsgNo, ref cachedHubStatePayload, cachedCreationInfoPayload, true);
+                                                chapterAdvanced = TryAdvanceMainCampaignIfEligible(activeIdentityHash, slotForStoryRewards, peer, stream, "Main Campaign", outMsgNo, ref cachedHubStatePayload, cachedCreationInfoPayload, false);
                                                 if (chapterAdvanced)
                                                 {
-                                                    outMsgNo = outMsgNo + 2;
+                                                    outMsgNo = outMsgNo + 1;
                                                 }
                                             }
                                             catch
@@ -4769,21 +4969,32 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             }
                                         }
 
-                                        // If mission progression changed within the current chapter, force the existing client pathway
-                                        // that queues RequestCurrentStorylineHub() by emitting a same-index ChapterChange.
-                                        // This avoids relying solely on unsolicited hub pushes (which can be ignored without pending request).
                                         if (!chapterAdvanced
                                             && slotForStoryRewards != null
                                             && (parsedTarget == StoryMissionstate.ReadyToPlay || parsedTarget == StoryMissionstate.Completed)
                                             && slotForStoryRewards.MainCampaignCurrentChapter >= 0)
                                         {
+                                            // Trigger a client-side hub refresh request when chapter hub names are stable.
+                                            // Emit transient chapter change to a different-hub chapter, then restore the real chapter.
+                                            // The authoritative snapshot sent below remains the source of truth.
                                             try
                                             {
-                                                var sameChapterIndex = slotForStoryRewards.MainCampaignCurrentChapter;
-                                                var chapterNudgeJson = "{\"TypeName\":\"Cliffhanger.SRO.ServerClientCommons.Metagameplay.ChapterChange, Cliffhanger.SRO.ServerClientCommons\",\"Storyline\":\"Main Campaign\",\"NewChapterIndex\":" + sameChapterIndex.ToString(CultureInfo.InvariantCulture) + "}";
-                                                var chapterNudgePayload = BuildUtf16StringPayload(chapterNudgeJson);
-                                                var chapterNudgeCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 36, chapterNudgePayload), outMsgNo++);
-                                                SendRawFrame(stream, peer, PrefixLength(chapterNudgeCore), "sent MetaGameplayCommunicationObject StoryprogressChanged (ChapterChange " + sameChapterIndex.ToString(CultureInfo.InvariantCulture) + ") nudge after SetStoryMissionStateMessage");
+                                                var currentChapterIndex = slotForStoryRewards.MainCampaignCurrentChapter;
+                                                var currentHubId = !IsNullOrWhiteSpace(slotForStoryRewards.HubId) ? slotForStoryRewards.HubId : DefaultHubId;
+
+                                                int triggerChapterIndex;
+                                                if (TryGetRefreshTriggerChapterIndexWithDifferentHub("Main Campaign", currentChapterIndex, currentHubId, out triggerChapterIndex))
+                                                {
+                                                    var triggerChapterJson = "{\"TypeName\":\"Cliffhanger.SRO.ServerClientCommons.Metagameplay.ChapterChange, Cliffhanger.SRO.ServerClientCommons\",\"Storyline\":\"Main Campaign\",\"NewChapterIndex\":" + triggerChapterIndex.ToString(CultureInfo.InvariantCulture) + "}";
+                                                    var triggerChapterPayload = BuildUtf16StringPayload(triggerChapterJson);
+                                                    var triggerChapterCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 36, triggerChapterPayload), outMsgNo++);
+                                                    SendRawFrame(stream, peer, PrefixLength(triggerChapterCore), "sent MetaGameplayCommunicationObject StoryprogressChanged (ChapterChange " + triggerChapterIndex.ToString(CultureInfo.InvariantCulture) + ") refresh trigger after SetStoryMissionStateMessage");
+
+                                                    var restoreChapterJson = "{\"TypeName\":\"Cliffhanger.SRO.ServerClientCommons.Metagameplay.ChapterChange, Cliffhanger.SRO.ServerClientCommons\",\"Storyline\":\"Main Campaign\",\"NewChapterIndex\":" + currentChapterIndex.ToString(CultureInfo.InvariantCulture) + "}";
+                                                    var restoreChapterPayload = BuildUtf16StringPayload(restoreChapterJson);
+                                                    var restoreChapterCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 36, restoreChapterPayload), outMsgNo++);
+                                                    SendRawFrame(stream, peer, PrefixLength(restoreChapterCore), "sent MetaGameplayCommunicationObject StoryprogressChanged (ChapterChange " + currentChapterIndex.ToString(CultureInfo.InvariantCulture) + ") refresh restore after SetStoryMissionStateMessage");
+                                                }
                                             }
                                             catch
                                             {
@@ -4795,11 +5006,11 @@ namespace Shadowrun.LocalService.Core.Protocols
                                         {
                                             try
                                             {
-                                                var hubId = !IsNullOrWhiteSpace(slotForStoryRewards.HubId) ? slotForStoryRewards.HubId : DefaultHubId;
                                                 var characterIdentifier = !IsNullOrWhiteSpace(slotForStoryRewards.CharacterIdentifier)
                                                     ? slotForStoryRewards.CharacterIdentifier
                                                     : (activeIdentityGuid.ToString() + ":" + activeCareerIndex.ToString());
-                                                cachedHubStatePayload = BuildMetaHubPushPayload(4, SerializeHubStateOrFallback(hubId, characterIdentifier, slotForStoryRewards.CharacterName, slotForStoryRewards));
+                                                var forceNewHubInstanceId = (parsedTarget == StoryMissionstate.ReadyToPlay || parsedTarget == StoryMissionstate.Completed || chapterAdvanced);
+                                                cachedHubStatePayload = BuildHubStatePayloadForSlot(slotForStoryRewards, characterIdentifier, forceNewHubInstanceId);
                                             }
                                             catch
                                             {
@@ -4815,37 +5026,6 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                 var metaSnapshotPayload = BuildUtf16StringPayload(zipped);
                                                 var metaSnapshotCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 26, metaSnapshotPayload), outMsgNo++);
                                                 SendRawFrame(stream, peer, PrefixLength(metaSnapshotCore), "sent MetaGameplayCommunicationObject SendMetagameplayDataSnapshotToClient after SetStoryMissionStateMessage");
-                                            }
-                                            catch
-                                            {
-                                            }
-                                        }
-
-                                        // In-session UX: accepting or completing/claiming a mission often needs an updated hub push
-                                        // so quest giver markers / dialogs refresh without requiring a restart.
-                                        if ((parsedTarget == StoryMissionstate.ReadyToPlay || parsedTarget == StoryMissionstate.Completed)
-                                            && cachedHubStatePayload != null
-                                            && cachedCreationInfoPayload != null)
-                                        {
-                                            try
-                                            {
-                                                if (!ShouldSuppressDuplicateHubPush(peer, false, cachedHubStatePayload))
-                                                {
-                                                    var hubStateCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 37, cachedHubStatePayload), outMsgNo++);
-                                                    SendRawFrame(stream, peer, PrefixLength(hubStateCore), "sent MetaGameplayCommunicationObject SendHubCommunicationObjectToClient after SetStoryMissionStateMessage");
-                                                }
-                                            }
-                                            catch
-                                            {
-                                            }
-
-                                            try
-                                            {
-                                                if (!ShouldSuppressDuplicateHubPush(peer, true, cachedCreationInfoPayload))
-                                                {
-                                                    var creationInfoCore = BuildCoreDirectSystem(1, BuildApSharedFieldEvent(5, 3, 38, cachedCreationInfoPayload), outMsgNo++);
-                                                    SendRawFrame(stream, peer, PrefixLength(creationInfoCore), "sent MetaGameplayCommunicationObject CreationInfoChanged after SetStoryMissionStateMessage");
-                                                }
                                             }
                                             catch
                                             {

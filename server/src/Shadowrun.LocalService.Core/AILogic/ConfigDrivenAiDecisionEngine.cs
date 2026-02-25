@@ -6,8 +6,11 @@ using Cliffhanger.SRO.ServerClientCommons.GameLogic.Components;
 using Cliffhanger.SRO.ServerClientCommons.ArtificialIntelligence;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.Locomotion;
+using Cliffhanger.SRO.ServerClientCommons.Gameworld.Map;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.RandomNumbers;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.Skills;
+using Cliffhanger.SRO.ServerClientCommons.Pathfinding;
+using SRO.Core.Compatibility.Gameplay.Levelrepresentation.Serialization;
 using SRO.Core.Compatibility.Math;
 
 namespace Shadowrun.LocalService.Core.AILogic
@@ -22,9 +25,25 @@ namespace Shadowrun.LocalService.Core.AILogic
     /// </summary>
     public sealed class ConfigDrivenAiDecisionEngine : IAiDecisionEngine
     {
+        private const float MoveBeforeShotMinChanceGain = 0f;
+        private const float MoveBeforeShotMinCoverGain = 0.05f;
+        private const float MoveBeforeShotMinScoreGain = 0.01f;
+        private const float MoveBeforeShotAllowedChanceDrop = 0.20f;
+        private const float MoveBeforeShotLowChanceThreshold = 0.75f;
+        private const float MoveBeforeShotOpenToCoverMinDefensiveCover = 0.30f;
+        private const float MoveBeforeShotOpenToCoverAllowedChanceDrop = 0.20f;
+        private const float RangedMinAttackChanceToCommit = 0.20f;
+        private const float MoveCoverBonusWeightDefensive = 1.50f;
+        private const float MoveCoverBonusWeightTarget = 2.00f;
+        private const float RangedCoverPriorityWeightTarget = 4.00f;
+        private const float RangedCoverPriorityWeightDefensive = 3.00f;
+        private const float RangedDetourForCoverMinPriorityGain = 1.25f;
+        private const float RangedDetourForCoverMaxChanceDrop = 0.20f;
+
         private readonly IAiBehaviourConfigLookup _configLookup;
         private readonly ISkillSelectionStrategyFactory _skillSelectionFactory;
         private readonly IRandomNumberGenerator _rng;
+        private readonly AiMovementScorer _movementScorer;
 
         // Minimal per-agent memory to reduce jitter:
         // - stick to a chosen nearest enemy instead of re-picking every sub-step
@@ -32,6 +51,7 @@ namespace Shadowrun.LocalService.Core.AILogic
         private readonly Dictionary<int, int> _stickyEnemyByAgentId = new Dictionary<int, int>();
         private readonly Dictionary<int, IntVector2D> _lastMoveFromByAgentId = new Dictionary<int, IntVector2D>();
         private readonly Dictionary<int, IntVector2D> _lastMoveToByAgentId = new Dictionary<int, IntVector2D>();
+        private readonly Dictionary<int, PendingActivityIntent> _pendingActivityByAgentId = new Dictionary<int, PendingActivityIntent>();
 
         public ConfigDrivenAiDecisionEngine(
             IAiBehaviourConfigLookup configLookup,
@@ -41,6 +61,7 @@ namespace Shadowrun.LocalService.Core.AILogic
             _configLookup = configLookup;
             _skillSelectionFactory = skillSelectionFactory;
             _rng = rng;
+            _movementScorer = new AiMovementScorer(new BasicValuationFactory());
         }
 
         public AiDecision Decide(Entity agent, IGameworldInstance gameworld)
@@ -75,6 +96,56 @@ namespace Shadowrun.LocalService.Core.AILogic
 
                 decision.DebugRotationType = rotation.GetType().FullName;
                 decision.DebugRotationCount = TryGetRotationCount(rotation);
+
+                var protagonistSnapshot = CreateSnapshot(gameworld, agent);
+                var isMeleeProfile = IsLikelyMeleeProfile(protagonistSnapshot);
+                var isRangedProfile = IsLikelyRangedProfile(protagonistSnapshot);
+                if (protagonistSnapshot != null)
+                {
+                    decision.DebugProfileRange = protagonistSnapshot.Range;
+                }
+
+                // If we moved in order to set up an activity on the previous sub-step,
+                // attempt that exact activity before evaluating fresh movement.
+                int pendingWeaponIndex;
+                int pendingSkillIndex;
+                ulong pendingActivityId;
+                IntVector2D pendingTarget;
+                var hasMoveActionAvailable = HasMoveActionAvailable(gameworld, agent);
+                if (hasMoveActionAvailable)
+                {
+                    _pendingActivityByAgentId.Remove(agent.Id);
+                }
+                else if (TryResolvePendingActivityShot(gameworld, agent, out pendingWeaponIndex, out pendingSkillIndex, out pendingActivityId, out pendingTarget))
+                {
+                    decision.DebugResolvedActivityId = pendingActivityId;
+                    decision.TargetPosition = pendingTarget;
+                    decision.HasAction = true;
+                    decision.SkillId = pendingActivityId;
+                    decision.WeaponIndex = pendingWeaponIndex;
+                    decision.SkillIndex = pendingSkillIndex;
+                    decision.DebugShotDistanceToTarget = TryComputeDistanceToTarget(gameworld, agent, pendingTarget);
+                    float pendingShotChanceToHit;
+                    if (TryComputeShotChanceToHit(gameworld, agent, pendingWeaponIndex, pendingSkillIndex, pendingActivityId, pendingTarget, out pendingShotChanceToHit))
+                    {
+                        decision.DebugShotChanceToHit = pendingShotChanceToHit;
+
+                        if (isRangedProfile && pendingShotChanceToHit < RangedMinAttackChanceToCommit)
+                        {
+                            decision.DebugStage = "pending-low-cth-deferred";
+                        }
+                        else
+                        {
+                            decision.DebugStage = "ok-pending";
+                            return decision;
+                        }
+                    }
+                    else
+                    {
+                        decision.DebugStage = "ok-pending";
+                        return decision;
+                    }
+                }
 
                 // Gather loadout info for debugging (even if we end up not using it).
                 try
@@ -165,12 +236,87 @@ namespace Shadowrun.LocalService.Core.AILogic
                     IntVector2D chosenTarget;
                     if (TryPickValidTargetPosition(gameworld, agent, weaponIndex ?? 0, skillIndex ?? 0, activityId, out chosenTarget))
                     {
+                        _pendingActivityByAgentId.Remove(agent.Id);
+
+                        var hasSelectedShotChance = false;
+                        var selectedShotChance = 0f;
+                        if (TryComputeShotChanceToHit(gameworld, agent, weaponIndex ?? 0, skillIndex ?? 0, activityId, chosenTarget, out selectedShotChance))
+                        {
+                            hasSelectedShotChance = true;
+                        }
+
+                        if (isRangedProfile)
+                        {
+                            IntVector2D preShotMove;
+                            float? moveDefensiveCover;
+                            float? moveTargetCover;
+                            float? moveScore;
+                            float? moveChanceToHit;
+                            var shotDistanceFromCurrent = TryComputeDistanceToTarget(gameworld, agent, chosenTarget);
+                            var forceRepositionForLongShot = protagonistSnapshot != null
+                                && shotDistanceFromCurrent.HasValue
+                                && shotDistanceFromCurrent.Value > protagonistSnapshot.Range + 2;
+                            var forceRepositionForLowShotChance = hasSelectedShotChance
+                                && selectedShotChance < RangedMinAttackChanceToCommit;
+                            var forceRepositionForShotQuality = forceRepositionForLongShot || forceRepositionForLowShotChance;
+                            if (TryPickMoveBeforeShotTarget(
+                                gameworld,
+                                agent,
+                                config,
+                                weaponIndex ?? 0,
+                                skillIndex ?? 0,
+                                activityId,
+                                chosenTarget,
+                                protagonistSnapshot,
+                                forceRepositionForShotQuality,
+                                out preShotMove,
+                                out moveDefensiveCover,
+                                out moveTargetCover,
+                                out moveScore,
+                                out moveChanceToHit))
+                            {
+                                decision.IsMove = true;
+                                decision.MoveTargetPosition = preShotMove;
+                                decision.HasAction = true;
+                                decision.DebugStage = "move-before-shot";
+                                decision.DebugResolvedActivityId = activityId;
+                                decision.DebugChosenMoveDefensiveCover = moveDefensiveCover;
+                                decision.DebugChosenMoveTargetCover = moveTargetCover;
+                                decision.DebugChosenMoveScore = moveScore;
+                                decision.DebugChosenMoveChanceToHit = moveChanceToHit;
+                                decision.DebugChosenMoveWithinWalkRange = IsWithinWalkRange(gameworld, agent, preShotMove);
+                                RememberPendingActivity(agent, weaponIndex ?? 0, skillIndex ?? 0, activityId);
+                                return decision;
+                            }
+
+                            if (forceRepositionForShotQuality)
+                            {
+                                decision.DebugStage = forceRepositionForLowShotChance
+                                    ? "low-cth-deferred"
+                                    : "long-shot-deferred";
+                                continue;
+                            }
+                        }
+
                         decision.DebugResolvedActivityId = activityId;
                         decision.TargetPosition = chosenTarget;
                         decision.HasAction = true;
                         decision.SkillId = activityId;
                         decision.WeaponIndex = weaponIndex;
                         decision.SkillIndex = skillIndex;
+                        decision.DebugShotDistanceToTarget = TryComputeDistanceToTarget(gameworld, agent, chosenTarget);
+                        if (hasSelectedShotChance)
+                        {
+                            decision.DebugShotChanceToHit = selectedShotChance;
+                        }
+                        else
+                        {
+                            float shotChanceToHit;
+                            if (TryComputeShotChanceToHit(gameworld, agent, weaponIndex ?? 0, skillIndex ?? 0, activityId, chosenTarget, out shotChanceToHit))
+                            {
+                                decision.DebugShotChanceToHit = shotChanceToHit;
+                            }
+                        }
                         decision.DebugStage = "ok";
                         return decision;
                     }
@@ -183,7 +329,11 @@ namespace Shadowrun.LocalService.Core.AILogic
                 // try to move to a reachable tile from which the same activity would have targets.
                 if (lastResolvedActivityId != 0UL)
                 {
-                    var setupPos = TryPickMoveTargetToEnableActivity(gameworld, agent, lastResolvedWeaponIndex, lastResolvedSkillIndex, lastResolvedActivityId);
+                    float? debugSetupMoveDefensiveCover;
+                    float? debugSetupMoveTargetCover;
+                    float? debugSetupMoveScore;
+                    float? debugSetupMoveChanceToHit;
+                    var setupPos = TryPickMoveTargetToEnableActivity(gameworld, agent, config, lastResolvedWeaponIndex, lastResolvedSkillIndex, lastResolvedActivityId, isMeleeProfile, isRangedProfile, out debugSetupMoveDefensiveCover, out debugSetupMoveTargetCover, out debugSetupMoveScore, out debugSetupMoveChanceToHit);
                     if (setupPos.HasValue)
                     {
                         decision.IsMove = true;
@@ -191,6 +341,12 @@ namespace Shadowrun.LocalService.Core.AILogic
                         decision.HasAction = true;
                         decision.DebugStage = "move-for-activity";
                         decision.DebugResolvedActivityId = lastResolvedActivityId;
+                        decision.DebugChosenMoveDefensiveCover = debugSetupMoveDefensiveCover;
+                        decision.DebugChosenMoveTargetCover = debugSetupMoveTargetCover;
+                        decision.DebugChosenMoveScore = debugSetupMoveScore;
+                        decision.DebugChosenMoveChanceToHit = debugSetupMoveChanceToHit;
+                        decision.DebugChosenMoveWithinWalkRange = IsWithinWalkRange(gameworld, agent, setupPos.Value);
+                        RememberPendingActivity(agent, lastResolvedWeaponIndex, lastResolvedSkillIndex, lastResolvedActivityId);
                         return decision;
                     }
                 }
@@ -210,6 +366,11 @@ namespace Shadowrun.LocalService.Core.AILogic
                 int? debugReducingCellCount;
                 bool? debugAvoidedImmediateBacktrack;
                 int? debugCurrentDist;
+                float? debugChosenMoveDefensiveCover;
+                float? debugChosenMoveTargetCover;
+                float? debugChosenMoveScore;
+                float? debugChosenMoveChanceToHit;
+                int? debugChosenMoveDist;
                 int? debugChosenEnemyTeamId;
                 bool? debugChosenEnemyTeamAi;
                 ulong? debugChosenEnemyControlPlayerId;
@@ -219,6 +380,7 @@ namespace Shadowrun.LocalService.Core.AILogic
                 IntVector2D? moveTarget = TryPickMoveTargetTowardNearestEnemyWithMemory(
                     gameworld,
                     agent,
+                    config,
                     out debugPreferredEnemyId,
                     out debugChosenEnemyId,
                     out debugChosenEnemyTeamId,
@@ -235,7 +397,14 @@ namespace Shadowrun.LocalService.Core.AILogic
                     out debugReachableCellCount,
                     out debugReducingCellCount,
                     out debugAvoidedImmediateBacktrack,
-                    out debugCurrentDist);
+                    out debugCurrentDist,
+                    out debugChosenMoveDist,
+                    out debugChosenMoveDefensiveCover,
+                    out debugChosenMoveTargetCover,
+                    out debugChosenMoveScore,
+                    out debugChosenMoveChanceToHit,
+                    isMeleeProfile,
+                    isRangedProfile);
 
                 decision.DebugPreferredEnemyId = debugPreferredEnemyId;
                 decision.DebugChosenEnemyId = debugChosenEnemyId;
@@ -254,6 +423,15 @@ namespace Shadowrun.LocalService.Core.AILogic
                 decision.DebugReducingCellCount = debugReducingCellCount;
                 decision.DebugAvoidedImmediateBacktrack = debugAvoidedImmediateBacktrack;
                 decision.DebugCurrentDistToEnemy = debugCurrentDist;
+                decision.DebugChosenMoveDistToEnemy = debugChosenMoveDist;
+                decision.DebugChosenMoveDefensiveCover = debugChosenMoveDefensiveCover;
+                decision.DebugChosenMoveTargetCover = debugChosenMoveTargetCover;
+                decision.DebugChosenMoveScore = debugChosenMoveScore;
+                decision.DebugChosenMoveChanceToHit = debugChosenMoveChanceToHit;
+                if (moveTarget.HasValue)
+                {
+                    decision.DebugChosenMoveWithinWalkRange = IsWithinWalkRange(gameworld, agent, moveTarget.Value);
+                }
 
                 if (moveTarget.HasValue)
                 {
@@ -261,6 +439,10 @@ namespace Shadowrun.LocalService.Core.AILogic
                     decision.MoveTargetPosition = moveTarget.Value;
                     decision.HasAction = true;
                     decision.DebugStage = "move";
+                    if (lastResolvedActivityId != 0UL)
+                    {
+                        RememberPendingActivity(agent, lastResolvedWeaponIndex, lastResolvedSkillIndex, lastResolvedActivityId);
+                    }
                     return decision;
                 }
 
@@ -690,6 +872,7 @@ namespace Shadowrun.LocalService.Core.AILogic
         private IntVector2D? TryPickMoveTargetTowardNearestEnemyWithMemory(
             IGameworldInstance gameworld,
             Entity agent,
+            AIBehaviourConfigurationComponent config,
             out int? debugPreferredEnemyId,
             out int? debugChosenEnemyId,
             out int? debugChosenEnemyTeamId,
@@ -706,7 +889,14 @@ namespace Shadowrun.LocalService.Core.AILogic
             out int? debugReachableCellCount,
             out int? debugReducingCellCount,
             out bool? debugAvoidedImmediateBacktrack,
-            out int? debugCurrentDistToEnemy)
+            out int? debugCurrentDistToEnemy,
+            out int? debugChosenMoveDistToEnemy,
+            out float? debugChosenMoveDefensiveCover,
+            out float? debugChosenMoveTargetCover,
+            out float? debugChosenMoveScore,
+            out float? debugChosenMoveChanceToHit,
+            bool preferDistanceOverCover,
+            bool restrictToWalkRange)
         {
             debugPreferredEnemyId = null;
             debugChosenEnemyId = null;
@@ -725,6 +915,11 @@ namespace Shadowrun.LocalService.Core.AILogic
             debugReducingCellCount = null;
             debugAvoidedImmediateBacktrack = null;
             debugCurrentDistToEnemy = null;
+            debugChosenMoveDistToEnemy = null;
+            debugChosenMoveDefensiveCover = null;
+            debugChosenMoveTargetCover = null;
+            debugChosenMoveScore = null;
+            debugChosenMoveChanceToHit = null;
 
             try
             {
@@ -740,6 +935,7 @@ namespace Shadowrun.LocalService.Core.AILogic
                     _stickyEnemyByAgentId.Clear();
                     _lastMoveFromByAgentId.Clear();
                     _lastMoveToByAgentId.Clear();
+                    _pendingActivityByAgentId.Clear();
                 }
 
                 var myPosN = TryGetAgentPosition(gameworld, agent);
@@ -837,27 +1033,51 @@ namespace Shadowrun.LocalService.Core.AILogic
 
                 debugReachableCellCount = reachableCells.Count;
 
+                var movementAssessments = config != null ? config.MovementAssessments : null;
+                var protagonistSnapshot = CreateSnapshot(gameworld, agent);
+                BasicValuationContext valuationContext = null;
+                if (protagonistSnapshot != null)
+                {
+                    valuationContext = new BasicValuationContext(gameworld, protagonistSnapshot);
+                }
+
                 // Prefer a cell that strictly reduces manhattan distance to the chosen enemy.
                 // If we can't reduce distance, allow a small "detour" step (equal or +1 manhattan)
                 // to route around obstacles, but never allow large increases.
                 var bestReducingDist = int.MaxValue;
                 IntVector2D bestReducing = IntVector2D.Zero;
                 var haveReducing = false;
+                var bestReducingScore = float.MinValue;
+                var bestReducingDefensiveCover = float.MinValue;
+                var bestReducingTargetCover = float.MinValue;
+                var bestReducingChanceToHit = float.MinValue;
 
                 var bestReducingBacktrackDist = int.MaxValue;
                 IntVector2D bestReducingBacktrack = IntVector2D.Zero;
                 var haveReducingBacktrack = false;
+                var bestReducingBacktrackScore = float.MinValue;
+                var bestReducingBacktrackDefensiveCover = float.MinValue;
+                var bestReducingBacktrackTargetCover = float.MinValue;
+                var bestReducingBacktrackChanceToHit = float.MinValue;
 
                 var bestDetourDist = int.MaxValue;
                 IntVector2D bestDetour = IntVector2D.Zero;
                 var haveDetour = false;
-                var detourCount = 0;
+                var bestDetourScore = float.MinValue;
+                var bestDetourDefensiveCover = float.MinValue;
+                var bestDetourTargetCover = float.MinValue;
+                var bestDetourChanceToHit = float.MinValue;
 
                 var avoidedBacktrack = false;
                 var reducingCount = 0;
                 foreach (var cell in reachableCells)
                 {
                     if (cell.X == myPos.X && cell.Y == myPos.Y)
+                    {
+                        continue;
+                    }
+
+                    if (restrictToWalkRange && !IsWithinWalkRange(gameworld, agent, cell))
                     {
                         continue;
                     }
@@ -892,15 +1112,36 @@ namespace Shadowrun.LocalService.Core.AILogic
                     {
                         // Detour candidate: allow equal distance or +1 only.
                         // This helps when a wall forces a lateral move before distance can reduce.
-                        if (dist <= currentDist + 1)
+                        var detourMaxDistance = preferDistanceOverCover ? currentDist : (currentDist + 1);
+                        if (!preferDistanceOverCover)
                         {
-                            detourCount++;
+                            detourMaxDistance = currentDist + 2;
+                        }
+                        if (dist <= detourMaxDistance)
+                        {
+                            // Keep as detour candidate.
                         }
                         else
                         {
                             continue;
                         }
                     }
+
+                    var moveScore = 0f;
+                    var chanceToHit = 0f;
+                    var defensiveCover = EvaluateDefensiveCoverScore(gameworld, agent, cell, chosenEnemy);
+                    var targetCover = EvaluateCoverAgainstThreat(gameworld, cell, chosenEnemy);
+                    if (chosenEnemy != null)
+                    {
+                        chanceToHit = valuationContext != null
+                            ? valuationContext.ChanceToHit(cell, protagonistSnapshot.Range, protagonistSnapshot.Accuracy, protagonistSnapshot.ToHitModifier, chosenEnemy)
+                            : 0f;
+                        moveScore = (valuationContext != null && _movementScorer != null)
+                            ? _movementScorer.ScorePosition(valuationContext, movementAssessments, chosenEnemy, cell)
+                            : 0f;
+                    }
+
+                    moveScore = ApplyCoverBonusToMoveScore(moveScore, defensiveCover, targetCover);
 
                     var isImmediateBacktrack = haveLastMove
                         && myPos.X == lastTo.X && myPos.Y == lastTo.Y
@@ -911,10 +1152,34 @@ namespace Shadowrun.LocalService.Core.AILogic
                         avoidedBacktrack = true;
                         if (dist < currentDist)
                         {
-                            if (!haveReducingBacktrack
-                                || dist < bestReducingBacktrackDist
-                                || (dist == bestReducingBacktrackDist && (cell.X < bestReducingBacktrack.X || (cell.X == bestReducingBacktrack.X && cell.Y < bestReducingBacktrack.Y))))
+                            var betterReducingBacktrack = !haveReducingBacktrack;
+                            if (!betterReducingBacktrack && preferDistanceOverCover)
                             {
+                                betterReducingBacktrack = dist < bestReducingBacktrackDist
+                                    || (dist == bestReducingBacktrackDist && targetCover > bestReducingBacktrackTargetCover)
+                                    || (dist == bestReducingBacktrackDist && targetCover == bestReducingBacktrackTargetCover && chanceToHit > bestReducingBacktrackChanceToHit)
+                                    || (dist == bestReducingBacktrackDist && chanceToHit == bestReducingBacktrackChanceToHit && moveScore > bestReducingBacktrackScore)
+                                    || (dist == bestReducingBacktrackDist && chanceToHit == bestReducingBacktrackChanceToHit && moveScore == bestReducingBacktrackScore && defensiveCover > bestReducingBacktrackDefensiveCover)
+                                    || (dist == bestReducingBacktrackDist && chanceToHit == bestReducingBacktrackChanceToHit && moveScore == bestReducingBacktrackScore && defensiveCover == bestReducingBacktrackDefensiveCover
+                                        && (cell.X < bestReducingBacktrack.X || (cell.X == bestReducingBacktrack.X && cell.Y < bestReducingBacktrack.Y)));
+                            }
+                            else if (!betterReducingBacktrack)
+                            {
+                                var coverPriority = ComputeRangedCoverPriority(targetCover, defensiveCover);
+                                var bestCoverPriority = ComputeRangedCoverPriority(bestReducingBacktrackTargetCover, bestReducingBacktrackDefensiveCover);
+                                betterReducingBacktrack = coverPriority > bestCoverPriority
+                                    || (coverPriority == bestCoverPriority && chanceToHit > bestReducingBacktrackChanceToHit)
+                                    || (coverPriority == bestCoverPriority && chanceToHit == bestReducingBacktrackChanceToHit && moveScore > bestReducingBacktrackScore)
+                                    || (coverPriority == bestCoverPriority && chanceToHit == bestReducingBacktrackChanceToHit && moveScore == bestReducingBacktrackScore && dist < bestReducingBacktrackDist)
+                                    || (dist == bestReducingBacktrackDist && (cell.X < bestReducingBacktrack.X || (cell.X == bestReducingBacktrack.X && cell.Y < bestReducingBacktrack.Y)));
+                            }
+
+                            if (betterReducingBacktrack)
+                            {
+                                bestReducingBacktrackScore = moveScore;
+                                bestReducingBacktrackDefensiveCover = defensiveCover;
+                                bestReducingBacktrackTargetCover = targetCover;
+                                bestReducingBacktrackChanceToHit = chanceToHit;
                                 bestReducingBacktrackDist = dist;
                                 bestReducingBacktrack = cell;
                                 haveReducingBacktrack = true;
@@ -925,10 +1190,34 @@ namespace Shadowrun.LocalService.Core.AILogic
 
                     if (dist < currentDist)
                     {
-                        if (!haveReducing
-                            || dist < bestReducingDist
-                            || (dist == bestReducingDist && (cell.X < bestReducing.X || (cell.X == bestReducing.X && cell.Y < bestReducing.Y))))
+                        var betterReducing = !haveReducing;
+                        if (!betterReducing && preferDistanceOverCover)
                         {
+                            betterReducing = dist < bestReducingDist
+                                || (dist == bestReducingDist && targetCover > bestReducingTargetCover)
+                                || (dist == bestReducingDist && targetCover == bestReducingTargetCover && chanceToHit > bestReducingChanceToHit)
+                                || (dist == bestReducingDist && chanceToHit == bestReducingChanceToHit && moveScore > bestReducingScore)
+                                || (dist == bestReducingDist && chanceToHit == bestReducingChanceToHit && moveScore == bestReducingScore && defensiveCover > bestReducingDefensiveCover)
+                                || (dist == bestReducingDist && chanceToHit == bestReducingChanceToHit && moveScore == bestReducingScore && defensiveCover == bestReducingDefensiveCover
+                                    && (cell.X < bestReducing.X || (cell.X == bestReducing.X && cell.Y < bestReducing.Y)));
+                        }
+                        else if (!betterReducing)
+                        {
+                            var coverPriority = ComputeRangedCoverPriority(targetCover, defensiveCover);
+                            var bestCoverPriority = ComputeRangedCoverPriority(bestReducingTargetCover, bestReducingDefensiveCover);
+                            betterReducing = coverPriority > bestCoverPriority
+                                || (coverPriority == bestCoverPriority && chanceToHit > bestReducingChanceToHit)
+                                || (coverPriority == bestCoverPriority && chanceToHit == bestReducingChanceToHit && moveScore > bestReducingScore)
+                                || (coverPriority == bestCoverPriority && chanceToHit == bestReducingChanceToHit && moveScore == bestReducingScore && dist < bestReducingDist)
+                                || (dist == bestReducingDist && (cell.X < bestReducing.X || (cell.X == bestReducing.X && cell.Y < bestReducing.Y)));
+                        }
+
+                        if (betterReducing)
+                        {
+                            bestReducingScore = moveScore;
+                            bestReducingDefensiveCover = defensiveCover;
+                            bestReducingTargetCover = targetCover;
+                            bestReducingChanceToHit = chanceToHit;
                             bestReducingDist = dist;
                             bestReducing = cell;
                             haveReducing = true;
@@ -937,10 +1226,34 @@ namespace Shadowrun.LocalService.Core.AILogic
                     else
                     {
                         // Detour step (equal or +1), only used when no reducing tile exists.
-                        if (!haveDetour
-                            || dist < bestDetourDist
-                            || (dist == bestDetourDist && (cell.X < bestDetour.X || (cell.X == bestDetour.X && cell.Y < bestDetour.Y))))
+                        var betterDetour = !haveDetour;
+                        if (!betterDetour && preferDistanceOverCover)
                         {
+                            betterDetour = dist < bestDetourDist
+                                || (dist == bestDetourDist && targetCover > bestDetourTargetCover)
+                                || (dist == bestDetourDist && targetCover == bestDetourTargetCover && chanceToHit > bestDetourChanceToHit)
+                                || (dist == bestDetourDist && chanceToHit == bestDetourChanceToHit && moveScore > bestDetourScore)
+                                || (dist == bestDetourDist && chanceToHit == bestDetourChanceToHit && moveScore == bestDetourScore && defensiveCover > bestDetourDefensiveCover)
+                                || (dist == bestDetourDist && chanceToHit == bestDetourChanceToHit && moveScore == bestDetourScore && defensiveCover == bestDetourDefensiveCover
+                                    && (cell.X < bestDetour.X || (cell.X == bestDetour.X && cell.Y < bestDetour.Y)));
+                        }
+                        else if (!betterDetour)
+                        {
+                            var coverPriority = ComputeRangedCoverPriority(targetCover, defensiveCover);
+                            var bestCoverPriority = ComputeRangedCoverPriority(bestDetourTargetCover, bestDetourDefensiveCover);
+                            betterDetour = coverPriority > bestCoverPriority
+                                || (coverPriority == bestCoverPriority && chanceToHit > bestDetourChanceToHit)
+                                || (coverPriority == bestCoverPriority && chanceToHit == bestDetourChanceToHit && moveScore > bestDetourScore)
+                                || (coverPriority == bestCoverPriority && chanceToHit == bestDetourChanceToHit && moveScore == bestDetourScore && dist < bestDetourDist)
+                                || (dist == bestDetourDist && (cell.X < bestDetour.X || (cell.X == bestDetour.X && cell.Y < bestDetour.Y)));
+                        }
+
+                        if (betterDetour)
+                        {
+                            bestDetourScore = moveScore;
+                            bestDetourDefensiveCover = defensiveCover;
+                            bestDetourTargetCover = targetCover;
+                            bestDetourChanceToHit = chanceToHit;
                             bestDetourDist = dist;
                             bestDetour = cell;
                             haveDetour = true;
@@ -955,19 +1268,63 @@ namespace Shadowrun.LocalService.Core.AILogic
                 }
 
                 IntVector2D chosen;
-                if (haveReducing)
+                float chosenDefensiveCover;
+                float chosenTargetCover;
+                float chosenScore;
+                float chosenChanceToHit;
+                var useCoveredDetour = false;
+                if (haveReducing && haveDetour && !preferDistanceOverCover && currentDist > 1)
+                {
+                    var bestReducingCoverPriority = ComputeRangedCoverPriority(bestReducingTargetCover, bestReducingDefensiveCover);
+                    var bestDetourCoverPriority = ComputeRangedCoverPriority(bestDetourTargetCover, bestDetourDefensiveCover);
+                    var coverPriorityGain = bestDetourCoverPriority - bestReducingCoverPriority;
+                    var chanceDropFromReducing = bestReducingChanceToHit - bestDetourChanceToHit;
+                    useCoveredDetour = coverPriorityGain >= RangedDetourForCoverMinPriorityGain
+                        && chanceDropFromReducing <= RangedDetourForCoverMaxChanceDrop;
+                }
+
+                if (haveReducing && !useCoveredDetour)
                 {
                     chosen = bestReducing;
+                    chosenDefensiveCover = bestReducingDefensiveCover;
+                    chosenTargetCover = bestReducingTargetCover;
+                    chosenScore = bestReducingScore;
+                    chosenChanceToHit = bestReducingChanceToHit;
+                }
+                else if (useCoveredDetour)
+                {
+                    chosen = bestDetour;
+                    chosenDefensiveCover = bestDetourDefensiveCover;
+                    chosenTargetCover = bestDetourTargetCover;
+                    chosenScore = bestDetourScore;
+                    chosenChanceToHit = bestDetourChanceToHit;
+
+                    if (debugEnemyReason == null)
+                    {
+                        debugEnemyReason = "detour-cover";
+                    }
+                    else
+                    {
+                        debugEnemyReason = debugEnemyReason + ";detour-cover";
+                    }
                 }
                 else if (haveReducingBacktrack)
                 {
                     // If backtracking is the only way to reduce distance, allow it.
                     chosen = bestReducingBacktrack;
+                    chosenDefensiveCover = bestReducingBacktrackDefensiveCover;
+                    chosenTargetCover = bestReducingBacktrackTargetCover;
+                    chosenScore = bestReducingBacktrackScore;
+                    chosenChanceToHit = bestReducingBacktrackChanceToHit;
                 }
                 else if (haveDetour && currentDist > 1)
                 {
                     // Detour only when we're not already adjacent.
                     chosen = bestDetour;
+                    chosenDefensiveCover = bestDetourDefensiveCover;
+                    chosenTargetCover = bestDetourTargetCover;
+                    chosenScore = bestDetourScore;
+                    chosenChanceToHit = bestDetourChanceToHit;
 
                     // Make the log reason explicit.
                     if (debugEnemyReason == null)
@@ -988,12 +1345,103 @@ namespace Shadowrun.LocalService.Core.AILogic
                 // Remember this move so we can avoid immediate reversals on the next Decide call.
                 _lastMoveFromByAgentId[agent.Id] = myPos;
                 _lastMoveToByAgentId[agent.Id] = chosen;
+                debugChosenMoveDefensiveCover = chosenDefensiveCover;
+                debugChosenMoveTargetCover = chosenTargetCover;
+                debugChosenMoveScore = chosenScore;
+                debugChosenMoveChanceToHit = chosenChanceToHit;
+                debugChosenMoveDistToEnemy = Math.Abs(enemyPos.X - chosen.X) + Math.Abs(enemyPos.Y - chosen.Y);
 
                 return chosen;
             }
             catch
             {
                 return null;
+            }
+        }
+
+        private static int? TryComputeDistanceToTarget(IGameworldInstance gameworld, Entity agent, IntVector2D target)
+        {
+            try
+            {
+                var attackerPos = TryGetAgentPosition(gameworld, agent);
+                if (!attackerPos.HasValue)
+                {
+                    return null;
+                }
+
+                return Math.Abs(target.X - attackerPos.Value.X) + Math.Abs(target.Y - attackerPos.Value.Y);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool TryComputeShotChanceToHit(
+            IGameworldInstance gameworld,
+            Entity agent,
+            int weaponIndex,
+            int skillIndex,
+            ulong activityId,
+            IntVector2D target,
+            out float chanceToHit)
+        {
+            chanceToHit = 0f;
+
+            try
+            {
+                if (gameworld == null || gameworld.ActivitySystem == null || agent == null || activityId == 0UL)
+                {
+                    return false;
+                }
+
+                var dryRunner = gameworld.ActivitySystem as IActivitySystemDryRunner;
+                if (dryRunner == null)
+                {
+                    return false;
+                }
+
+                ActivityEvaluationResult eval;
+                try
+                {
+                    eval = dryRunner.DryRunActivity(weaponIndex, skillIndex, activityId, agent, target);
+                }
+                catch
+                {
+                    eval = null;
+                }
+
+                if (eval == null || !eval.SkillWasSuccessful || eval.TargetWorkspaces == null || eval.TargetWorkspaces.AvailableTargets <= 0)
+                {
+                    return false;
+                }
+
+                var bestChance = -1f;
+                foreach (var workspace in eval.TargetWorkspaces)
+                {
+                    if (workspace.Value == null)
+                    {
+                        continue;
+                    }
+
+                    if (workspace.Value.ChanceToHit > bestChance)
+                    {
+                        bestChance = workspace.Value.ChanceToHit;
+                    }
+                }
+
+                if (bestChance < 0f)
+                {
+                    return false;
+                }
+
+                chanceToHit = bestChance;
+                return true;
+            }
+            catch
+            {
+                chanceToHit = 0f;
+                return false;
             }
         }
 
@@ -1265,8 +1713,12 @@ namespace Shadowrun.LocalService.Core.AILogic
             }
         }
 
-        private static IntVector2D? TryPickMoveTargetToEnableActivity(IGameworldInstance gameworld, Entity agent, int weaponIndex, int skillIndex, ulong activityId)
+        private IntVector2D? TryPickMoveTargetToEnableActivity(IGameworldInstance gameworld, Entity agent, AIBehaviourConfigurationComponent config, int weaponIndex, int skillIndex, ulong activityId, bool preferDistanceOverCover, bool requireWalkRange, out float? debugChosenMoveDefensiveCover, out float? debugChosenMoveTargetCover, out float? debugChosenMoveScore, out float? debugChosenMoveChanceToHit)
         {
+            debugChosenMoveDefensiveCover = null;
+            debugChosenMoveTargetCover = null;
+            debugChosenMoveScore = null;
+            debugChosenMoveChanceToHit = null;
             try
             {
                 if (gameworld == null || agent == null || activityId == 0UL)
@@ -1300,13 +1752,31 @@ namespace Shadowrun.LocalService.Core.AILogic
 
                 var runtimeGrid = gameworld.RuntimeGrid;
 
+                var protagonistSnapshot = CreateSnapshot(gameworld, agent);
+                BasicValuationContext valuationContext = null;
+                if (protagonistSnapshot != null)
+                {
+                    valuationContext = new BasicValuationContext(gameworld, protagonistSnapshot, weaponIndex, skillIndex, activityId);
+                }
+
+                var movementAssessments = config != null ? config.MovementAssessments : null;
+
                 var bestMoveDist = int.MaxValue;
+                var bestScore = float.MinValue;
+                var bestDefensiveCover = float.MinValue;
+                var bestTargetCover = float.MinValue;
+                var bestChanceToHit = float.MinValue;
                 IntVector2D best = IntVector2D.Zero;
                 var haveBest = false;
 
                 foreach (var cell in reachableCells)
                 {
                     if (cell.X == myPos.X && cell.Y == myPos.Y)
+                    {
+                        continue;
+                    }
+
+                    if (requireWalkRange && !IsWithinWalkRange(gameworld, agent, cell))
                     {
                         continue;
                     }
@@ -1347,11 +1817,68 @@ namespace Shadowrun.LocalService.Core.AILogic
                         continue;
                     }
 
-                    var moveDist = Math.Abs(cell.X - myPos.X) + Math.Abs(cell.Y - myPos.Y);
-                    if (!haveBest
-                        || moveDist < bestMoveDist
-                        || (moveDist == bestMoveDist && (cell.X < best.X || (cell.X == best.X && cell.Y < best.Y))))
+                    Entity scoringTarget = null;
+                    var previewChanceToHit = 0f;
+                    foreach (var targetWorkspace in eval.TargetWorkspaces)
                     {
+                        if (targetWorkspace.Value == null)
+                        {
+                            continue;
+                        }
+
+                        if (scoringTarget == null || targetWorkspace.Value.ChanceToHit > previewChanceToHit)
+                        {
+                            scoringTarget = targetWorkspace.Key;
+                            previewChanceToHit = targetWorkspace.Value.ChanceToHit;
+                        }
+                    }
+
+                    if (scoringTarget == null)
+                    {
+                        continue;
+                    }
+
+                    var moveScore = 0f;
+                    var chanceToHit = previewChanceToHit;
+                    var defensiveCover = EvaluateDefensiveCoverScore(gameworld, agent, cell, scoringTarget);
+                    var targetCover = EvaluateCoverAgainstThreat(gameworld, cell, scoringTarget);
+                    if (valuationContext != null && _movementScorer != null)
+                    {
+                        moveScore = _movementScorer.ScorePosition(valuationContext, movementAssessments, scoringTarget, cell);
+                        chanceToHit = valuationContext.ChanceToHit(cell, protagonistSnapshot.Range, protagonistSnapshot.Accuracy, protagonistSnapshot.ToHitModifier, scoringTarget);
+                    }
+
+                    moveScore = ApplyCoverBonusToMoveScore(moveScore, defensiveCover, targetCover);
+
+                    var moveDist = Math.Abs(cell.X - myPos.X) + Math.Abs(cell.Y - myPos.Y);
+                    var isBetter = !haveBest;
+                    if (!isBetter && preferDistanceOverCover)
+                    {
+                        isBetter = moveDist < bestMoveDist
+                            || (moveDist == bestMoveDist && targetCover > bestTargetCover)
+                            || (moveDist == bestMoveDist && targetCover == bestTargetCover && chanceToHit > bestChanceToHit)
+                            || (moveDist == bestMoveDist && chanceToHit == bestChanceToHit && moveScore > bestScore)
+                            || (moveDist == bestMoveDist && chanceToHit == bestChanceToHit && moveScore == bestScore && defensiveCover > bestDefensiveCover)
+                            || (moveDist == bestMoveDist && chanceToHit == bestChanceToHit && moveScore == bestScore && defensiveCover == bestDefensiveCover
+                                && (cell.X < best.X || (cell.X == best.X && cell.Y < best.Y)));
+                    }
+                    else if (!isBetter)
+                    {
+                        var coverPriority = ComputeRangedCoverPriority(targetCover, defensiveCover);
+                        var bestCoverPriority = ComputeRangedCoverPriority(bestTargetCover, bestDefensiveCover);
+                        isBetter = coverPriority > bestCoverPriority
+                            || (coverPriority == bestCoverPriority && chanceToHit > bestChanceToHit)
+                            || (coverPriority == bestCoverPriority && chanceToHit == bestChanceToHit && moveScore > bestScore)
+                            || (coverPriority == bestCoverPriority && chanceToHit == bestChanceToHit && moveScore == bestScore && moveDist < bestMoveDist)
+                            || (moveScore == bestScore && chanceToHit == bestChanceToHit && moveDist == bestMoveDist && (cell.X < best.X || (cell.X == best.X && cell.Y < best.Y)));
+                    }
+
+                    if (isBetter)
+                    {
+                        bestScore = moveScore;
+                        bestDefensiveCover = defensiveCover;
+                        bestTargetCover = targetCover;
+                        bestChanceToHit = chanceToHit;
                         bestMoveDist = moveDist;
                         best = cell;
                         haveBest = true;
@@ -1360,6 +1887,10 @@ namespace Shadowrun.LocalService.Core.AILogic
 
                 if (haveBest)
                 {
+                    debugChosenMoveDefensiveCover = bestDefensiveCover;
+                    debugChosenMoveTargetCover = bestTargetCover;
+                    debugChosenMoveScore = bestScore;
+                    debugChosenMoveChanceToHit = bestChanceToHit;
                     return best;
                 }
 
@@ -1369,6 +1900,580 @@ namespace Shadowrun.LocalService.Core.AILogic
             {
                 return null;
             }
+        }
+
+        private bool TryPickMoveBeforeShotTarget(
+            IGameworldInstance gameworld,
+            Entity agent,
+            AIBehaviourConfigurationComponent config,
+            int weaponIndex,
+            int skillIndex,
+            ulong activityId,
+            IntVector2D currentlyChosenTarget,
+            IAgentSnapshot protagonistSnapshot,
+            bool forceReposition,
+            out IntVector2D moveTarget,
+            out float? moveDefensiveCover,
+            out float? moveTargetCover,
+            out float? moveScore,
+            out float? moveChanceToHit)
+        {
+            moveTarget = IntVector2D.Zero;
+            moveDefensiveCover = null;
+            moveTargetCover = null;
+            moveScore = null;
+            moveChanceToHit = null;
+
+            try
+            {
+                float? repositionDefensiveCover;
+                float? repositionTargetCover;
+                float? repositionScore;
+                float? repositionChanceToHit;
+                var reposition = TryPickMoveTargetToEnableActivity(
+                    gameworld,
+                    agent,
+                    config,
+                    weaponIndex,
+                    skillIndex,
+                    activityId,
+                    false,
+                    true,
+                    out repositionDefensiveCover,
+                    out repositionTargetCover,
+                    out repositionScore,
+                    out repositionChanceToHit);
+
+                if (!reposition.HasValue || !repositionChanceToHit.HasValue || !repositionDefensiveCover.HasValue)
+                {
+                    return false;
+                }
+
+                if (forceReposition)
+                {
+                    moveTarget = reposition.Value;
+                    moveDefensiveCover = repositionDefensiveCover;
+                    moveTargetCover = repositionTargetCover;
+                    moveScore = repositionScore;
+                    moveChanceToHit = repositionChanceToHit;
+                    return true;
+                }
+
+                float currentChanceToHit;
+                float currentDefensiveCover;
+                float currentMoveScore;
+                if (!TryEvaluateCurrentShotMetrics(
+                    gameworld,
+                    agent,
+                    config,
+                    weaponIndex,
+                    skillIndex,
+                    activityId,
+                    currentlyChosenTarget,
+                    protagonistSnapshot,
+                    out currentChanceToHit,
+                    out currentDefensiveCover,
+                    out currentMoveScore))
+                {
+                    return false;
+                }
+
+                var chanceGain = repositionChanceToHit.Value - currentChanceToHit;
+                var coverGain = repositionDefensiveCover.Value - currentDefensiveCover;
+                var scoreGain = (repositionScore.HasValue ? repositionScore.Value : 0f) - currentMoveScore;
+                var allowsSlightChanceTradeForCover = coverGain >= MoveBeforeShotMinCoverGain
+                    && repositionChanceToHit.Value >= currentChanceToHit - MoveBeforeShotAllowedChanceDrop;
+                var allowsSlightChanceTradeForScore = scoreGain >= MoveBeforeShotMinScoreGain
+                    && repositionChanceToHit.Value >= currentChanceToHit - MoveBeforeShotAllowedChanceDrop;
+                var lowChanceForcesReposition = currentChanceToHit <= MoveBeforeShotLowChanceThreshold
+                    && repositionChanceToHit.Value >= currentChanceToHit - 0.05f
+                    && scoreGain >= 0f;
+                var openToCoverForcesReposition = currentDefensiveCover <= 0.05f
+                    && repositionDefensiveCover.Value >= MoveBeforeShotOpenToCoverMinDefensiveCover
+                    && repositionChanceToHit.Value >= currentChanceToHit - MoveBeforeShotOpenToCoverAllowedChanceDrop;
+
+                if (chanceGain < MoveBeforeShotMinChanceGain
+                    && !allowsSlightChanceTradeForCover
+                    && !allowsSlightChanceTradeForScore
+                    && !lowChanceForcesReposition
+                    && !openToCoverForcesReposition)
+                {
+                    return false;
+                }
+
+                moveTarget = reposition.Value;
+                moveDefensiveCover = repositionDefensiveCover;
+                moveTargetCover = repositionTargetCover;
+                moveScore = repositionScore;
+                moveChanceToHit = repositionChanceToHit;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static float EvaluateCoverAgainstThreat(IGameworldInstance gameworld, IntVector2D candidatePosition, Entity threat)
+        {
+            try
+            {
+                if (gameworld == null || gameworld.EntitySystem == null || gameworld.CoverSystem == null || threat == null)
+                {
+                    return 0f;
+                }
+
+                IntVector2D threatPos;
+                try
+                {
+                    threatPos = gameworld.EntitySystem.GetAgentGridPosition(threat);
+                }
+                catch
+                {
+                    return 0f;
+                }
+
+                ICover cover;
+                try
+                {
+                    cover = gameworld.CoverSystem.DetermineCover(threatPos, candidatePosition);
+                }
+                catch
+                {
+                    cover = null;
+                }
+
+                var coverPenalty = cover != null ? cover.CTHPenalty : 0f;
+                if (coverPenalty < 0f)
+                {
+                    return 0f;
+                }
+
+                if (coverPenalty > 1f)
+                {
+                    return 1f;
+                }
+
+                return coverPenalty;
+            }
+            catch
+            {
+                return 0f;
+            }
+        }
+
+        private static float ApplyCoverBonusToMoveScore(float baseScore, float defensiveCover, float targetCover)
+        {
+            return baseScore
+                + defensiveCover * MoveCoverBonusWeightDefensive
+                + targetCover * MoveCoverBonusWeightTarget;
+        }
+
+        private static float ComputeRangedCoverPriority(float targetCover, float defensiveCover)
+        {
+            return (targetCover * RangedCoverPriorityWeightTarget) + (defensiveCover * RangedCoverPriorityWeightDefensive);
+        }
+
+        private bool TryEvaluateCurrentShotMetrics(
+            IGameworldInstance gameworld,
+            Entity agent,
+            AIBehaviourConfigurationComponent config,
+            int weaponIndex,
+            int skillIndex,
+            ulong activityId,
+            IntVector2D targetPosition,
+            IAgentSnapshot protagonistSnapshot,
+            out float chanceToHit,
+            out float defensiveCover,
+            out float moveScore)
+        {
+            chanceToHit = 0f;
+            defensiveCover = 0f;
+            moveScore = 0f;
+
+            try
+            {
+                if (gameworld == null || gameworld.ActivitySystem == null || agent == null)
+                {
+                    return false;
+                }
+
+                var dryRunner = gameworld.ActivitySystem as IActivitySystemDryRunner;
+                if (dryRunner == null)
+                {
+                    return false;
+                }
+
+                ActivityEvaluationResult eval;
+                try
+                {
+                    eval = dryRunner.DryRunActivity(weaponIndex, skillIndex, activityId, agent, targetPosition);
+                }
+                catch
+                {
+                    eval = null;
+                }
+
+                if (eval == null || !eval.SkillWasSuccessful || eval.TargetWorkspaces == null || eval.TargetWorkspaces.AvailableTargets <= 0)
+                {
+                    return false;
+                }
+
+                Entity bestTarget = null;
+                var bestChance = 0f;
+                foreach (var targetWorkspace in eval.TargetWorkspaces)
+                {
+                    if (targetWorkspace.Value == null)
+                    {
+                        continue;
+                    }
+
+                    if (bestTarget == null || targetWorkspace.Value.ChanceToHit > bestChance)
+                    {
+                        bestTarget = targetWorkspace.Key;
+                        bestChance = targetWorkspace.Value.ChanceToHit;
+                    }
+                }
+
+                if (bestTarget == null)
+                {
+                    return false;
+                }
+
+                var myPosN = TryGetAgentPosition(gameworld, agent);
+                if (!myPosN.HasValue)
+                {
+                    return false;
+                }
+
+                chanceToHit = bestChance;
+                defensiveCover = EvaluateDefensiveCoverScore(gameworld, agent, myPosN.Value, bestTarget);
+                var targetCover = EvaluateCoverAgainstThreat(gameworld, myPosN.Value, bestTarget);
+
+                if (protagonistSnapshot != null && _movementScorer != null)
+                {
+                    var movementAssessments = config != null ? config.MovementAssessments : null;
+                    var valuationContext = new BasicValuationContext(gameworld, protagonistSnapshot, weaponIndex, skillIndex, activityId);
+                    moveScore = _movementScorer.ScorePosition(valuationContext, movementAssessments, bestTarget, myPosN.Value);
+                    chanceToHit = valuationContext.ChanceToHit(myPosN.Value, protagonistSnapshot.Range, protagonistSnapshot.Accuracy, protagonistSnapshot.ToHitModifier, bestTarget);
+                }
+
+                moveScore = ApplyCoverBonusToMoveScore(moveScore, defensiveCover, targetCover);
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsLikelyMeleeProfile(IAgentSnapshot snapshot)
+        {
+            return snapshot != null && snapshot.Range <= 1;
+        }
+
+        private static bool IsLikelyRangedProfile(IAgentSnapshot snapshot)
+        {
+            return snapshot != null && snapshot.Range > 1;
+        }
+
+        private static bool IsWithinWalkRange(IGameworldInstance gameworld, Entity agent, IntVector2D position)
+        {
+            try
+            {
+                if (gameworld == null || gameworld.ReachableRangesCalculator == null || agent == null)
+                {
+                    return false;
+                }
+
+                var ranges = gameworld.ReachableRangesCalculator.GetReachableRanges(agent);
+                if (ranges == null || ranges.WalkRange == null)
+                {
+                    return false;
+                }
+
+                return ranges.WalkRange.Contains(position);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool HasMoveActionAvailable(IGameworldInstance gameworld, Entity agent)
+        {
+            try
+            {
+                if (gameworld == null || gameworld.EntitySystem == null || agent == null)
+                {
+                    return false;
+                }
+
+                AttributeBackedStatusValueContainer statusValues;
+                if (!gameworld.EntitySystem.TryGetComponent<AttributeBackedStatusValueContainer>(agent, out statusValues) || statusValues == null)
+                {
+                    return false;
+                }
+
+                return statusValues.GetByIdOrReturnDefault(458755UL) > 0f;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void RememberPendingActivity(Entity agent, int weaponIndex, int skillIndex, ulong activityId)
+        {
+            if (agent == null || activityId == 0UL)
+            {
+                return;
+            }
+
+            _pendingActivityByAgentId[agent.Id] = new PendingActivityIntent(weaponIndex, skillIndex, activityId);
+        }
+
+        private bool TryResolvePendingActivityShot(
+            IGameworldInstance gameworld,
+            Entity agent,
+            out int weaponIndex,
+            out int skillIndex,
+            out ulong activityId,
+            out IntVector2D target)
+        {
+            weaponIndex = 0;
+            skillIndex = 0;
+            activityId = 0UL;
+            target = IntVector2D.Zero;
+
+            if (agent == null)
+            {
+                return false;
+            }
+
+            PendingActivityIntent pending;
+            if (!_pendingActivityByAgentId.TryGetValue(agent.Id, out pending))
+            {
+                return false;
+            }
+
+            _pendingActivityByAgentId.Remove(agent.Id);
+
+            if (pending.ActivityId == 0UL)
+            {
+                return false;
+            }
+
+            IntVector2D chosenTarget;
+            if (!TryPickValidTargetPosition(gameworld, agent, pending.WeaponIndex, pending.SkillIndex, pending.ActivityId, out chosenTarget))
+            {
+                return false;
+            }
+
+            weaponIndex = pending.WeaponIndex;
+            skillIndex = pending.SkillIndex;
+            activityId = pending.ActivityId;
+            target = chosenTarget;
+            return true;
+        }
+
+        private struct PendingActivityIntent
+        {
+            public PendingActivityIntent(int weaponIndex, int skillIndex, ulong activityId)
+            {
+                WeaponIndex = weaponIndex;
+                SkillIndex = skillIndex;
+                ActivityId = activityId;
+            }
+
+            public int WeaponIndex;
+            public int SkillIndex;
+            public ulong ActivityId;
+        }
+
+        private static IAgentSnapshot CreateSnapshot(IGameworldInstance gameworld, Entity agent)
+        {
+            try
+            {
+                if (gameworld == null || gameworld.EntitySystem == null || agent == null)
+                {
+                    return null;
+                }
+
+                IntVector2D position;
+                try
+                {
+                    position = gameworld.EntitySystem.GetAgentGridPosition(agent);
+                }
+                catch
+                {
+                    return null;
+                }
+
+                var range = 0;
+                var walkRange = 0;
+                var sprintRange = 0;
+                var accuracy = 0.5f;
+                var toHitModifier = 0f;
+
+                AttributeBackedStatusValueContainer statusValues;
+                if (gameworld.EntitySystem.TryGetComponent<AttributeBackedStatusValueContainer>(agent, out statusValues) && statusValues != null)
+                {
+                    range = (int)statusValues.GetByIdOrReturnDefault(458766UL);
+                    walkRange = statusValues.GetWalkRange();
+                    sprintRange = statusValues.GetSprintRange();
+                    accuracy = statusValues.GetByIdOrReturnDefault(458757UL);
+                    toHitModifier = statusValues.GetByIdOrReturnDefault(458768UL);
+                }
+
+                NodeList reachablePositions = null;
+                try
+                {
+                    if (gameworld.ReachableRangesCalculator != null)
+                    {
+                        reachablePositions = gameworld.ReachableRangesCalculator.GetReachabilty(agent);
+                    }
+                }
+                catch
+                {
+                    reachablePositions = null;
+                }
+
+                return new EngineAgentSnapshot(agent, position, range, walkRange, sprintRange, accuracy, toHitModifier, reachablePositions);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static float EvaluateDefensiveCoverScore(IGameworldInstance gameworld, Entity agent, IntVector2D candidatePosition, Entity prioritizedThreat)
+        {
+            try
+            {
+                if (gameworld == null || gameworld.EntitySystem == null || gameworld.CoverSystem == null || agent == null)
+                {
+                    return 0f;
+                }
+
+                TeamComponent myTeam;
+                if (!gameworld.EntitySystem.TryGetComponent<TeamComponent>(agent, out myTeam) || myTeam == null)
+                {
+                    return 0f;
+                }
+
+                var myTeamId = myTeam.TeamID;
+                var weightedCover = 0f;
+                var totalWeight = 0f;
+
+                foreach (var other in gameworld.EntitySystem.GetAllEntities())
+                {
+                    if (other == null || other == agent)
+                    {
+                        continue;
+                    }
+
+                    TeamComponent otherTeam;
+                    if (!gameworld.EntitySystem.TryGetComponent<TeamComponent>(other, out otherTeam) || otherTeam == null)
+                    {
+                        continue;
+                    }
+
+                    if (otherTeam.TeamID == myTeamId)
+                    {
+                        continue;
+                    }
+
+                    GameplayPropertiesComponent gp;
+                    if (gameworld.EntitySystem.TryGetComponent<GameplayPropertiesComponent>(other, out gp) && gp != null && gp.InteractiveObject)
+                    {
+                        continue;
+                    }
+
+                    IntVector2D enemyPos;
+                    try
+                    {
+                        enemyPos = gameworld.EntitySystem.GetAgentGridPosition(other);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    ICover cover;
+                    try
+                    {
+                        cover = gameworld.CoverSystem.DetermineCover(enemyPos, candidatePosition);
+                    }
+                    catch
+                    {
+                        cover = null;
+                    }
+
+                    var coverPenalty = cover != null ? cover.CTHPenalty : 0f;
+                    if (coverPenalty < 0f)
+                    {
+                        coverPenalty = 0f;
+                    }
+                    else if (coverPenalty > 1f)
+                    {
+                        coverPenalty = 1f;
+                    }
+
+                    var dist = Math.Abs(enemyPos.X - candidatePosition.X) + Math.Abs(enemyPos.Y - candidatePosition.Y);
+                    var distanceWeight = 1f / (1f + dist);
+                    var priorityWeight = prioritizedThreat != null && other.Id == prioritizedThreat.Id ? 2f : 1f;
+                    var weight = distanceWeight * priorityWeight;
+
+                    weightedCover += coverPenalty * weight;
+                    totalWeight += weight;
+                }
+
+                if (totalWeight <= 0f)
+                {
+                    return 0f;
+                }
+
+                return weightedCover / totalWeight;
+            }
+            catch
+            {
+                return 0f;
+            }
+        }
+
+        private sealed class EngineAgentSnapshot : IAgentSnapshot
+        {
+            public EngineAgentSnapshot(Entity entity, IntVector2D position, int range, int walkRange, int sprintRange, float accuracy, float toHitModifier, NodeList reachablePositions)
+            {
+                Entity = entity;
+                Position = position;
+                Range = range;
+                WalkRange = walkRange;
+                SprintRange = sprintRange;
+                Accuracy = accuracy;
+                ToHitModifier = toHitModifier;
+                ReachablePositions = reachablePositions;
+            }
+
+            public int Range { get; private set; }
+
+            public IntVector2D Position { get; private set; }
+
+            public int WalkRange { get; private set; }
+
+            public int SprintRange { get; private set; }
+
+            public float Accuracy { get; private set; }
+
+            public float ToHitModifier { get; private set; }
+
+            public Entity Entity { get; private set; }
+
+            public NodeList ReachablePositions { get; set; }
+
+            public IPointOfInterestDefinition MainPointOfInterest { get; set; }
         }
 
         private static IntVector2D? TryPickMoveTargetTowardNearestEnemy(IGameworldInstance gameworld, Entity agent)

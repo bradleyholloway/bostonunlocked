@@ -950,6 +950,7 @@ namespace Shadowrun.LocalService.Core.Protocols
             public string Hub;
             public List<string> RequiredMissions = new List<string>();
             public List<string> RequiredUnlocks = new List<string>();
+            public List<string> DialogNpcIds = new List<string>();
         }
 
         private bool TryGetStoryline(string storylineTechnicalName, out StorylineInfo storyline)
@@ -1168,6 +1169,45 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             if (!IsNullOrWhiteSpace(missionName))
                                             {
                                                 ch.RequiredMissions.Add(missionName);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // NPCs with chapter dialogs (used for interaction-state fallback when explicit
+                                // InteractedWithNpcMessage traffic is absent in some client flows).
+                                if (chapterDict.Contains("DialogsForChapter") && chapterDict["DialogsForChapter"] != null)
+                                {
+                                    object[] dialogsArr = chapterDict["DialogsForChapter"] as object[];
+                                    if (dialogsArr == null)
+                                    {
+                                        var dialogsList = chapterDict["DialogsForChapter"] as ArrayList;
+                                        if (dialogsList != null)
+                                        {
+                                            dialogsArr = new object[dialogsList.Count];
+                                            dialogsList.CopyTo(dialogsArr);
+                                        }
+                                    }
+
+                                    if (dialogsArr != null)
+                                    {
+                                        for (var d = 0; d < dialogsArr.Length; d++)
+                                        {
+                                            var dialogDef = dialogsArr[d] as IDictionary;
+                                            if (dialogDef == null)
+                                            {
+                                                continue;
+                                            }
+
+                                            var npcId = dialogDef.Contains("Id") ? (dialogDef["Id"] as string) : null;
+                                            if (IsNullOrWhiteSpace(npcId))
+                                            {
+                                                continue;
+                                            }
+
+                                            if (!ch.DialogNpcIds.Contains(npcId))
+                                            {
+                                                ch.DialogNpcIds.Add(npcId);
                                             }
                                         }
                                     }

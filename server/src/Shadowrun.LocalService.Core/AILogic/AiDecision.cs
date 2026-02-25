@@ -49,6 +49,15 @@ namespace Shadowrun.LocalService.Core.AILogic
             DebugReducingCellCount = null;
             DebugAvoidedImmediateBacktrack = null;
             DebugCurrentDistToEnemy = null;
+            DebugChosenMoveDistToEnemy = null;
+            DebugChosenMoveDefensiveCover = null;
+            DebugChosenMoveTargetCover = null;
+            DebugChosenMoveScore = null;
+            DebugChosenMoveChanceToHit = null;
+            DebugChosenMoveWithinWalkRange = null;
+            DebugProfileRange = null;
+            DebugShotDistanceToTarget = null;
+            DebugShotChanceToHit = null;
         }
 
         public Entity Agent { get; private set; }
@@ -102,6 +111,15 @@ namespace Shadowrun.LocalService.Core.AILogic
         public int? DebugReducingCellCount { get; set; }
         public bool? DebugAvoidedImmediateBacktrack { get; set; }
         public int? DebugCurrentDistToEnemy { get; set; }
+        public int? DebugChosenMoveDistToEnemy { get; set; }
+        public float? DebugChosenMoveDefensiveCover { get; set; }
+        public float? DebugChosenMoveTargetCover { get; set; }
+        public float? DebugChosenMoveScore { get; set; }
+        public float? DebugChosenMoveChanceToHit { get; set; }
+        public bool? DebugChosenMoveWithinWalkRange { get; set; }
+        public int? DebugProfileRange { get; set; }
+        public int? DebugShotDistanceToTarget { get; set; }
+        public float? DebugShotChanceToHit { get; set; }
 
         /// <summary>
         /// Target position for position-targeted commands (if applicable).

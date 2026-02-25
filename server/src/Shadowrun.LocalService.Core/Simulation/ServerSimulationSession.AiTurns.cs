@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.CommandProcessing;
 using Cliffhanger.SRO.ServerClientCommons.Gameworld.Commands;
@@ -134,6 +135,15 @@ namespace Shadowrun.LocalService.Core.Simulation
             int? debugReducingCellCount = null;
             bool? debugAvoidedImmediateBacktrack = null;
             int? debugCurrentDistToEnemy = null;
+            int? debugChosenMoveDistToEnemy = null;
+            float? debugChosenMoveDefensiveCover = null;
+            float? debugChosenMoveTargetCover = null;
+            float? debugChosenMoveScore = null;
+            float? debugChosenMoveChanceToHit = null;
+            bool? debugChosenMoveWithinWalkRange = null;
+            int? debugProfileRange = null;
+            int? debugShotDistanceToTarget = null;
+            float? debugShotChanceToHit = null;
             if (_enableAiLogic && _aiDecisionEngine != null)
             {
                 try
@@ -172,6 +182,15 @@ namespace Shadowrun.LocalService.Core.Simulation
                         debugReducingCellCount = decision.DebugReducingCellCount;
                         debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
                         debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
+                        debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
+                        debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
+                        debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
+                        debugChosenMoveScore = decision.DebugChosenMoveScore;
+                        debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
+                        debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
+                        debugProfileRange = decision.DebugProfileRange;
+                        debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
+                        debugShotChanceToHit = decision.DebugShotChanceToHit;
                     }
                     else if (decision != null && decision.HasAction && decision.SkillId != 0UL)
                     {
@@ -215,6 +234,15 @@ namespace Shadowrun.LocalService.Core.Simulation
                         debugReducingCellCount = decision.DebugReducingCellCount;
                         debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
                         debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
+                        debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
+                        debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
+                        debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
+                        debugChosenMoveScore = decision.DebugChosenMoveScore;
+                        debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
+                        debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
+                        debugProfileRange = decision.DebugProfileRange;
+                        debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
+                        debugShotChanceToHit = decision.DebugShotChanceToHit;
 
                         if (decision.TargetEntity != null)
                         {
@@ -258,6 +286,15 @@ namespace Shadowrun.LocalService.Core.Simulation
                             debugReducingCellCount = decision.DebugReducingCellCount;
                             debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
                             debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
+                            debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
+                            debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
+                            debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
+                            debugChosenMoveScore = decision.DebugChosenMoveScore;
+                            debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
+                            debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
+                            debugProfileRange = decision.DebugProfileRange;
+                            debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
+                            debugShotChanceToHit = decision.DebugShotChanceToHit;
                         }
                     }
                 }
@@ -274,6 +311,38 @@ namespace Shadowrun.LocalService.Core.Simulation
             {
                 try
                 {
+                    var debugReasoning = BuildAiDecisionReasoning(
+                        decisionNote,
+                        commandName,
+                        debugStage,
+                        desiredSkill,
+                        desiredWeaponIndex,
+                        desiredSkillIndex,
+                        targetPos,
+                        debugResolvedActivityId,
+                        debugRawSelection,
+                        debugRotationType,
+                        debugRotationCount,
+                        debugChosenEnemyId,
+                        debugEnemyPick,
+                        debugEnemyReason,
+                        debugEnemyX,
+                        debugEnemyY,
+                        debugEnemyCandidateCount,
+                        debugReachableCellCount,
+                        debugReducingCellCount,
+                        debugAvoidedImmediateBacktrack,
+                        debugCurrentDistToEnemy,
+                        debugChosenMoveDistToEnemy,
+                        debugChosenMoveDefensiveCover,
+                        debugChosenMoveTargetCover,
+                        debugChosenMoveScore,
+                        debugChosenMoveChanceToHit,
+                        debugChosenMoveWithinWalkRange,
+                        debugProfileRange,
+                        debugShotDistanceToTarget,
+                        debugShotChanceToHit);
+
                     _logger.LogAi(new
                     {
                         ts = RequestLogger.UtcNowIso(),
@@ -311,6 +380,16 @@ namespace Shadowrun.LocalService.Core.Simulation
                         debugReducingCellCount = debugReducingCellCount,
                         debugAvoidedImmediateBacktrack = debugAvoidedImmediateBacktrack,
                         debugCurrentDistToEnemy = debugCurrentDistToEnemy,
+                        debugChosenMoveDistToEnemy = debugChosenMoveDistToEnemy,
+                        debugChosenMoveDefensiveCover = debugChosenMoveDefensiveCover,
+                        debugChosenMoveTargetCover = debugChosenMoveTargetCover,
+                        debugChosenMoveScore = debugChosenMoveScore,
+                        debugChosenMoveChanceToHit = debugChosenMoveChanceToHit,
+                        debugChosenMoveWithinWalkRange = debugChosenMoveWithinWalkRange,
+                        debugProfileRange = debugProfileRange,
+                        debugShotDistanceToTarget = debugShotDistanceToTarget,
+                        debugShotChanceToHit = debugShotChanceToHit,
+                        debugReasoning = debugReasoning,
                         command = commandName,
                         targetX = targetPos.X,
                         targetY = targetPos.Y,
@@ -436,6 +515,197 @@ namespace Shadowrun.LocalService.Core.Simulation
                 skillToUse,
                 seeds);
             return true;
+        }
+
+        private static string BuildAiDecisionReasoning(
+            string decisionNote,
+            string commandName,
+            string debugStage,
+            ulong desiredSkill,
+            int desiredWeaponIndex,
+            int desiredSkillIndex,
+            IntVector2D targetPos,
+            ulong debugResolvedActivityId,
+            ulong debugRawSelection,
+            string debugRotationType,
+            int? debugRotationCount,
+            int? debugChosenEnemyId,
+            string debugEnemyPick,
+            string debugEnemyReason,
+            int? debugEnemyX,
+            int? debugEnemyY,
+            int? debugEnemyCandidateCount,
+            int? debugReachableCellCount,
+            int? debugReducingCellCount,
+            bool? debugAvoidedImmediateBacktrack,
+            int? debugCurrentDistToEnemy,
+            int? debugChosenMoveDistToEnemy,
+            float? debugChosenMoveDefensiveCover,
+            float? debugChosenMoveTargetCover,
+            float? debugChosenMoveScore,
+            float? debugChosenMoveChanceToHit,
+            bool? debugChosenMoveWithinWalkRange,
+            int? debugProfileRange,
+            int? debugShotDistanceToTarget,
+            float? debugShotChanceToHit)
+        {
+            var sb = new StringBuilder(256);
+
+            sb.Append("note=");
+            sb.Append(string.IsNullOrEmpty(decisionNote) ? "none" : decisionNote);
+
+            sb.Append(";command=");
+            sb.Append(string.IsNullOrEmpty(commandName) ? "unknown" : commandName);
+
+            if (!string.IsNullOrEmpty(debugStage))
+            {
+                sb.Append(";stage=");
+                sb.Append(debugStage);
+            }
+
+            if (commandName == "AI.Move")
+            {
+                sb.Append(";moveTarget=(");
+                sb.Append(targetPos.X);
+                sb.Append(",");
+                sb.Append(targetPos.Y);
+                sb.Append(")");
+
+                if (debugChosenEnemyId.HasValue)
+                {
+                    sb.Append(";enemyId=");
+                    sb.Append(debugChosenEnemyId.Value);
+                }
+                if (!string.IsNullOrEmpty(debugEnemyPick))
+                {
+                    sb.Append(";enemyPick=");
+                    sb.Append(debugEnemyPick);
+                }
+                if (!string.IsNullOrEmpty(debugEnemyReason))
+                {
+                    sb.Append(";enemyReason=");
+                    sb.Append(debugEnemyReason);
+                }
+                if (debugEnemyX.HasValue && debugEnemyY.HasValue)
+                {
+                    sb.Append(";enemyPos=(");
+                    sb.Append(debugEnemyX.Value);
+                    sb.Append(",");
+                    sb.Append(debugEnemyY.Value);
+                    sb.Append(")");
+                }
+                if (debugCurrentDistToEnemy.HasValue)
+                {
+                    sb.Append(";distToEnemy=");
+                    sb.Append(debugCurrentDistToEnemy.Value);
+                }
+                if (debugChosenMoveDistToEnemy.HasValue)
+                {
+                    sb.Append(";distAfterMove=");
+                    sb.Append(debugChosenMoveDistToEnemy.Value);
+                }
+                if (debugReachableCellCount.HasValue)
+                {
+                    sb.Append(";reachable=");
+                    sb.Append(debugReachableCellCount.Value);
+                }
+                if (debugReducingCellCount.HasValue)
+                {
+                    sb.Append(";reducing=");
+                    sb.Append(debugReducingCellCount.Value);
+                }
+                if (debugAvoidedImmediateBacktrack.HasValue)
+                {
+                    sb.Append(";avoidedBacktrack=");
+                    sb.Append(debugAvoidedImmediateBacktrack.Value ? "true" : "false");
+                }
+                if (debugChosenMoveDefensiveCover.HasValue)
+                {
+                    sb.Append(";defCover=");
+                    sb.Append(debugChosenMoveDefensiveCover.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                if (debugChosenMoveTargetCover.HasValue)
+                {
+                    sb.Append(";targetCover=");
+                    sb.Append(debugChosenMoveTargetCover.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+                    sb.Append(";targetExposure=");
+                    sb.Append((1f - debugChosenMoveTargetCover.Value).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                if (debugChosenMoveScore.HasValue)
+                {
+                    sb.Append(";moveScore=");
+                    sb.Append(debugChosenMoveScore.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                if (debugChosenMoveChanceToHit.HasValue)
+                {
+                    sb.Append(";offCth=");
+                    sb.Append(debugChosenMoveChanceToHit.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                if (debugChosenMoveWithinWalkRange.HasValue)
+                {
+                    sb.Append(";walkMove=");
+                    sb.Append(debugChosenMoveWithinWalkRange.Value ? "true" : "false");
+                }
+            }
+            else
+            {
+                sb.Append(";skill=");
+                sb.Append(desiredSkill);
+                sb.Append(";weaponIndex=");
+                sb.Append(desiredWeaponIndex);
+                sb.Append(";skillIndex=");
+                sb.Append(desiredSkillIndex);
+                sb.Append(";target=(");
+                sb.Append(targetPos.X);
+                sb.Append(",");
+                sb.Append(targetPos.Y);
+                sb.Append(")");
+
+                if (debugShotDistanceToTarget.HasValue)
+                {
+                    sb.Append(";shotDist=");
+                    sb.Append(debugShotDistanceToTarget.Value);
+                }
+                if (debugShotChanceToHit.HasValue)
+                {
+                    sb.Append(";shotCth=");
+                    sb.Append(debugShotChanceToHit.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+                }
+            }
+
+            if (debugProfileRange.HasValue)
+            {
+                sb.Append(";profileRange=");
+                sb.Append(debugProfileRange.Value);
+            }
+
+            if (debugResolvedActivityId != 0UL)
+            {
+                sb.Append(";resolvedActivity=");
+                sb.Append(debugResolvedActivityId);
+            }
+            if (debugRawSelection != 0UL)
+            {
+                sb.Append(";rawSelection=");
+                sb.Append(debugRawSelection);
+            }
+            if (!string.IsNullOrEmpty(debugRotationType))
+            {
+                sb.Append(";rotationType=");
+                sb.Append(debugRotationType);
+            }
+            if (debugRotationCount.HasValue)
+            {
+                sb.Append(";rotationCount=");
+                sb.Append(debugRotationCount.Value);
+            }
+            if (debugEnemyCandidateCount.HasValue)
+            {
+                sb.Append(";enemyCandidates=");
+                sb.Append(debugEnemyCandidateCount.Value);
+            }
+
+            return sb.ToString();
         }
     }
 }
