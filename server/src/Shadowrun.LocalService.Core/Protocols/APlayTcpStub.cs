@@ -73,6 +73,7 @@ namespace Shadowrun.LocalService.Core.Protocols
         private readonly object _coopMissionLock = new object();
         private readonly Dictionary<string, List<CoopMissionParticipant>> _coopMissionParticipants = new Dictionary<string, List<CoopMissionParticipant>>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CoopMissionSessionState> _coopMissionSessions = new Dictionary<string, CoopMissionSessionState>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, Dictionary<Guid, List<ParsedHenchmanSelection>>> _coopMissionHenchSelections = new Dictionary<string, Dictionary<Guid, List<ParsedHenchmanSelection>>>(StringComparer.OrdinalIgnoreCase);
 
         private static string SerializeDefaultHenchmanCollection()
         {
@@ -1094,6 +1095,29 @@ namespace Shadowrun.LocalService.Core.Protocols
             }
 
             return results.Count > 0 ? results : null;
+        }
+
+        private static List<ParsedHenchmanSelection> TryExtractCoopPayloadHenchmanSelections(string payload)
+        {
+            if (IsNullOrWhiteSpace(payload))
+            {
+                return null;
+            }
+
+            var trimmed = payload.Trim();
+            if (trimmed.Length == 0)
+            {
+                return null;
+            }
+
+            // Coop start sends the selection array directly as payload string #4, not wrapped under a "HenchmanSelection" key.
+            // Reuse the singleplayer parser by wrapping into a small object.
+            if (trimmed[0] == '[')
+            {
+                return TryExtractHenchmanSelections("{\"HenchmanSelection\":" + trimmed + "}");
+            }
+
+            return TryExtractHenchmanSelections(trimmed);
         }
 
         private static int FindMatchingBracket(string json, int startIndex)
@@ -3095,6 +3119,9 @@ namespace Shadowrun.LocalService.Core.Protocols
                             if (isCoopMissionStart)
                             {
                                 var coopGroupName = payloadStrings[0];
+                                var coopParsedSelections = payloadStrings.Count > 3
+                                    ? TryExtractCoopPayloadHenchmanSelections(payloadStrings[3])
+                                    : null;
 
                                 string mapName = null;
                                 if (payloadStrings.Count >= 3 && !IsNullOrWhiteSpace(payloadStrings[2]))
@@ -3132,10 +3159,30 @@ namespace Shadowrun.LocalService.Core.Protocols
                                     coopGroupName = coopGroupName,
                                     mapName = mapName,
                                     memberList = payloadStrings.Count > 1 ? payloadStrings[1] : null,
+                                    henchSelectionCount = coopParsedSelections != null ? coopParsedSelections.Count : 0,
                                 });
 
                                 currentCoopGroupName = coopGroupName;
                                 RegisterCoopMissionParticipant(coopGroupName, peer, stream);
+
+                                lock (_coopMissionLock)
+                                {
+                                    Dictionary<Guid, List<ParsedHenchmanSelection>> byIdentity;
+                                    if (!_coopMissionHenchSelections.TryGetValue(coopGroupName, out byIdentity) || byIdentity == null)
+                                    {
+                                        byIdentity = new Dictionary<Guid, List<ParsedHenchmanSelection>>();
+                                        _coopMissionHenchSelections[coopGroupName] = byIdentity;
+                                    }
+
+                                    if (coopParsedSelections != null && coopParsedSelections.Count > 0)
+                                    {
+                                        byIdentity[activeIdentityGuid] = new List<ParsedHenchmanSelection>(coopParsedSelections);
+                                    }
+                                    else
+                                    {
+                                        byIdentity.Remove(activeIdentityGuid);
+                                    }
+                                }
 
                                 var requestMsgNoBase = direct.Value.MsgNo + 250;
 
@@ -3216,6 +3263,69 @@ namespace Shadowrun.LocalService.Core.Protocols
                                             var careerIndices = new int[identityGuids.Length];
                                             var slots = new CareerSlot[identityGuids.Length];
                                             var playerIds = new ulong[identityGuids.Length];
+                                            var selectedHenchmenPerPlayer = new PlayerCharacterSnapshot[identityGuids.Length][];
+
+                                            Dictionary<Guid, List<ParsedHenchmanSelection>> coopSelectionsByIdentity = null;
+                                            lock (_coopMissionLock)
+                                            {
+                                                Dictionary<Guid, List<ParsedHenchmanSelection>> tmp;
+                                                if (_coopMissionHenchSelections.TryGetValue(coopGroupName, out tmp) && tmp != null)
+                                                {
+                                                    coopSelectionsByIdentity = new Dictionary<Guid, List<ParsedHenchmanSelection>>();
+                                                    foreach (var kv in tmp)
+                                                    {
+                                                        coopSelectionsByIdentity[kv.Key] = kv.Value != null
+                                                            ? new List<ParsedHenchmanSelection>(kv.Value)
+                                                            : null;
+                                                    }
+                                                }
+                                            }
+
+                                            // Allow a brief rendezvous window so both clients' StartCoop payloads can land,
+                                            // carrying one selection each. This avoids creating the shared sim from only
+                                            // the first-arriving participant's data.
+                                            var waitUntilUtc = DateTime.UtcNow.AddMilliseconds(1200);
+                                            while (DateTime.UtcNow < waitUntilUtc)
+                                            {
+                                                var allHaveSelection = true;
+                                                for (var i = 0; i < identityGuids.Length; i++)
+                                                {
+                                                    if (coopSelectionsByIdentity == null)
+                                                    {
+                                                        allHaveSelection = false;
+                                                        break;
+                                                    }
+
+                                                    List<ParsedHenchmanSelection> parsed;
+                                                    if (!coopSelectionsByIdentity.TryGetValue(identityGuids[i], out parsed) || parsed == null || parsed.Count == 0)
+                                                    {
+                                                        allHaveSelection = false;
+                                                        break;
+                                                    }
+                                                }
+
+                                                if (allHaveSelection)
+                                                {
+                                                    break;
+                                                }
+
+                                                SleepWithStop(stopEvent, 50);
+
+                                                lock (_coopMissionLock)
+                                                {
+                                                    Dictionary<Guid, List<ParsedHenchmanSelection>> tmp;
+                                                    if (_coopMissionHenchSelections.TryGetValue(coopGroupName, out tmp) && tmp != null)
+                                                    {
+                                                        coopSelectionsByIdentity = new Dictionary<Guid, List<ParsedHenchmanSelection>>();
+                                                        foreach (var kv in tmp)
+                                                        {
+                                                            coopSelectionsByIdentity[kv.Key] = kv.Value != null
+                                                                ? new List<ParsedHenchmanSelection>(kv.Value)
+                                                                : null;
+                                                        }
+                                                    }
+                                                }
+                                            }
 
                                             for (var i = 0; i < identityGuids.Length; i++)
                                             {
@@ -3237,9 +3347,46 @@ namespace Shadowrun.LocalService.Core.Protocols
                                                     }
                                                 }
                                                 playerIds[i] = mappedEntityId;
+
+                                                List<ParsedHenchmanSelection> parsedSelections;
+                                                if (coopSelectionsByIdentity != null
+                                                    && coopSelectionsByIdentity.TryGetValue(guid, out parsedSelections)
+                                                    && parsedSelections != null
+                                                    && parsedSelections.Count > 0)
+                                                {
+                                                    SerializeDefaultHenchmanCollection();
+                                                    var snapshots = CachedHenchmanCollectionSnapshots;
+                                                    if (snapshots != null && snapshots.Count > 0)
+                                                    {
+                                                        var ownerKarma = slots[i] != null ? slots[i].Karma : 0;
+                                                        var ownerNuyen = slots[i] != null ? slots[i].Nuyen : 0;
+
+                                                        var resolved = new List<PlayerCharacterSnapshot>();
+                                                        for (var si = 0; si < parsedSelections.Count; si++)
+                                                        {
+                                                            var selection = parsedSelections[si];
+                                                            if (selection.HenchmanId < 0 || selection.HenchmanId >= snapshots.Count)
+                                                            {
+                                                                continue;
+                                                            }
+
+                                                            var src = snapshots[selection.HenchmanId];
+                                                            var clone = CloneHenchSnapshotForMission(src, guid, si, ownerKarma, ownerNuyen);
+                                                            if (clone != null)
+                                                            {
+                                                                resolved.Add(clone);
+                                                            }
+                                                        }
+
+                                                        if (resolved.Count > 0)
+                                                        {
+                                                            selectedHenchmenPerPlayer[i] = resolved.ToArray();
+                                                        }
+                                                    }
+                                                }
                                             }
 
-                                            compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedCoopMatchConfiguration(mapName, identityGuids, careerIndices, slots, playerIds);
+                                            compressedMatchConfiguration = _matchConfigurationGenerator.GetCompressedCoopMatchConfiguration(mapName, identityGuids, careerIndices, slots, playerIds, selectedHenchmenPerPlayer);
                                         }
                                         else
                                         {
@@ -6307,6 +6454,7 @@ namespace Shadowrun.LocalService.Core.Protocols
                 if (list.Count == 0)
                 {
                     _coopMissionParticipants.Remove(coopGroupName);
+                    _coopMissionHenchSelections.Remove(coopGroupName);
 
                     CoopMissionSessionState session;
                     if (_coopMissionSessions.TryGetValue(coopGroupName, out session) && session != null)

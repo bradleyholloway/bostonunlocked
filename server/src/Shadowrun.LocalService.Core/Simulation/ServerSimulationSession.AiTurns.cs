@@ -219,115 +219,140 @@ namespace Shadowrun.LocalService.Core.Simulation
             }
             else if (_enableAiLogic && _aiDecisionEngine != null)
             {
-                try
+                var foundActionableDecision = false;
+
+                for (var memberIndex = 0; memberIndex < activatableMembers.Length; memberIndex++)
                 {
-                    var decision = _aiDecisionEngine.Decide(agent, _gameworld);
-                    if (decision != null && decision.HasAction && decision.IsMove)
+                    var candidate = activatableMembers[memberIndex];
+                    string candidateSpawnManagerTag;
+                    var candidateEligible = IsAgentEligibleForCombatAction(candidate, out candidateSpawnManagerTag);
+                    if (!candidateEligible)
                     {
-                        commandName = "AI.Move";
-                        decisionNote = "move";
-                        targetPos = decision.MoveTargetPosition;
-
-                        debugStage = decision.DebugStage;
-                        debugRotationType = decision.DebugRotationType;
-                        debugRotationCount = decision.DebugRotationCount;
-                        debugRawSelection = decision.DebugRawSelection;
-                        debugResolvedActivityId = decision.DebugResolvedActivityId;
-                        debugHasAiConfig = decision.DebugHasAiConfig;
-                        debugHasLoadout = decision.DebugHasLoadout;
-                        debugSelectedWeaponIndex = decision.DebugSelectedWeaponIndex;
-                        debugSelectedWeaponSkillCount = decision.DebugSelectedWeaponSkillCount;
-
-                        debugPreferredEnemyId = decision.DebugPreferredEnemyId;
-                        debugChosenEnemyId = decision.DebugChosenEnemyId;
-                        debugChosenEnemyTeamId = decision.DebugChosenEnemyTeamId;
-                        debugChosenEnemyTeamAi = decision.DebugChosenEnemyTeamAi;
-                        debugChosenEnemyControlPlayerId = decision.DebugChosenEnemyControlPlayerId;
-                        debugChosenEnemyControlAi = decision.DebugChosenEnemyControlAi;
-                        debugChosenEnemyIsPlayersPlayerCharacter = decision.DebugChosenEnemyIsPlayersPlayerCharacter;
-                        debugChosenEnemyInteractiveObject = decision.DebugChosenEnemyInteractiveObject;
-                        debugEnemyPick = decision.DebugEnemyPick;
-                        debugEnemyReason = decision.DebugEnemyReason;
-                        debugEnemyX = decision.DebugEnemyX;
-                        debugEnemyY = decision.DebugEnemyY;
-                        debugEnemyCandidateCount = decision.DebugEnemyCandidateCount;
-                        debugReachableCellCount = decision.DebugReachableCellCount;
-                        debugReducingCellCount = decision.DebugReducingCellCount;
-                        debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
-                        debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
-                        debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
-                        debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
-                        debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
-                        debugChosenMoveScore = decision.DebugChosenMoveScore;
-                        debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
-                        debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
-                        debugProfileRange = decision.DebugProfileRange;
-                        debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
-                        debugShotChanceToHit = decision.DebugShotChanceToHit;
-                    }
-                    else if (decision != null && decision.HasAction && decision.SkillId != 0UL)
-                    {
-                        desiredSkill = decision.SkillId;
-                        commandName = "AI.Decision";
-                        decisionNote = "ok";
-
-                        if (decision.WeaponIndex.HasValue)
+                        if (string.IsNullOrEmpty(candidateSpawnManagerTag)
+                            || _encounterActivationTracker == null
+                            || !_encounterActivationTracker.TryEngageSpawnTagFromCurrentPlayerVisibility(candidateSpawnManagerTag))
                         {
-                            desiredWeaponIndex = decision.WeaponIndex.Value;
-                        }
-                        if (decision.SkillIndex.HasValue)
-                        {
-                            desiredSkillIndex = decision.SkillIndex.Value;
-                        }
-
-                        debugStage = decision.DebugStage;
-                        debugRotationType = decision.DebugRotationType;
-                        debugRotationCount = decision.DebugRotationCount;
-                        debugRawSelection = decision.DebugRawSelection;
-                        debugResolvedActivityId = decision.DebugResolvedActivityId;
-                        debugHasAiConfig = decision.DebugHasAiConfig;
-                        debugHasLoadout = decision.DebugHasLoadout;
-                        debugSelectedWeaponIndex = decision.DebugSelectedWeaponIndex;
-                        debugSelectedWeaponSkillCount = decision.DebugSelectedWeaponSkillCount;
-
-                        debugPreferredEnemyId = decision.DebugPreferredEnemyId;
-                        debugChosenEnemyId = decision.DebugChosenEnemyId;
-                        debugChosenEnemyTeamId = decision.DebugChosenEnemyTeamId;
-                        debugChosenEnemyTeamAi = decision.DebugChosenEnemyTeamAi;
-                        debugChosenEnemyControlPlayerId = decision.DebugChosenEnemyControlPlayerId;
-                        debugChosenEnemyControlAi = decision.DebugChosenEnemyControlAi;
-                        debugChosenEnemyIsPlayersPlayerCharacter = decision.DebugChosenEnemyIsPlayersPlayerCharacter;
-                        debugChosenEnemyInteractiveObject = decision.DebugChosenEnemyInteractiveObject;
-                        debugEnemyPick = decision.DebugEnemyPick;
-                        debugEnemyReason = decision.DebugEnemyReason;
-                        debugEnemyX = decision.DebugEnemyX;
-                        debugEnemyY = decision.DebugEnemyY;
-                        debugEnemyCandidateCount = decision.DebugEnemyCandidateCount;
-                        debugReachableCellCount = decision.DebugReachableCellCount;
-                        debugReducingCellCount = decision.DebugReducingCellCount;
-                        debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
-                        debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
-                        debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
-                        debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
-                        debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
-                        debugChosenMoveScore = decision.DebugChosenMoveScore;
-                        debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
-                        debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
-                        debugProfileRange = decision.DebugProfileRange;
-                        debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
-                        debugShotChanceToHit = decision.DebugShotChanceToHit;
-
-                        if (decision.TargetEntity != null)
-                        {
-                            targetPos = TryGetAgentGridPositionOrDefault(decision.TargetEntity);
-                        }
-                        else
-                        {
-                            targetPos = decision.TargetPosition;
+                            continue;
                         }
                     }
-                    else
+
+                    agent = candidate;
+
+                    try
                     {
+                        var decision = _aiDecisionEngine.Decide(agent, _gameworld);
+                        if (decision != null && decision.HasAction && decision.IsMove)
+                        {
+                            commandName = "AI.Move";
+                            decisionNote = "move";
+                            targetPos = decision.MoveTargetPosition;
+
+                            debugStage = decision.DebugStage;
+                            debugRotationType = decision.DebugRotationType;
+                            debugRotationCount = decision.DebugRotationCount;
+                            debugRawSelection = decision.DebugRawSelection;
+                            debugResolvedActivityId = decision.DebugResolvedActivityId;
+                            debugHasAiConfig = decision.DebugHasAiConfig;
+                            debugHasLoadout = decision.DebugHasLoadout;
+                            debugSelectedWeaponIndex = decision.DebugSelectedWeaponIndex;
+                            debugSelectedWeaponSkillCount = decision.DebugSelectedWeaponSkillCount;
+
+                            debugPreferredEnemyId = decision.DebugPreferredEnemyId;
+                            debugChosenEnemyId = decision.DebugChosenEnemyId;
+                            debugChosenEnemyTeamId = decision.DebugChosenEnemyTeamId;
+                            debugChosenEnemyTeamAi = decision.DebugChosenEnemyTeamAi;
+                            debugChosenEnemyControlPlayerId = decision.DebugChosenEnemyControlPlayerId;
+                            debugChosenEnemyControlAi = decision.DebugChosenEnemyControlAi;
+                            debugChosenEnemyIsPlayersPlayerCharacter = decision.DebugChosenEnemyIsPlayersPlayerCharacter;
+                            debugChosenEnemyInteractiveObject = decision.DebugChosenEnemyInteractiveObject;
+                            debugEnemyPick = decision.DebugEnemyPick;
+                            debugEnemyReason = decision.DebugEnemyReason;
+                            debugEnemyX = decision.DebugEnemyX;
+                            debugEnemyY = decision.DebugEnemyY;
+                            debugEnemyCandidateCount = decision.DebugEnemyCandidateCount;
+                            debugReachableCellCount = decision.DebugReachableCellCount;
+                            debugReducingCellCount = decision.DebugReducingCellCount;
+                            debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
+                            debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
+                            debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
+                            debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
+                            debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
+                            debugChosenMoveScore = decision.DebugChosenMoveScore;
+                            debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
+                            debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
+                            debugProfileRange = decision.DebugProfileRange;
+                            debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
+                            debugShotChanceToHit = decision.DebugShotChanceToHit;
+
+                            foundActionableDecision = true;
+                            break;
+                        }
+
+                        if (decision != null && decision.HasAction && decision.SkillId != 0UL)
+                        {
+                            desiredSkill = decision.SkillId;
+                            commandName = "AI.Decision";
+                            decisionNote = "ok";
+
+                            if (decision.WeaponIndex.HasValue)
+                            {
+                                desiredWeaponIndex = decision.WeaponIndex.Value;
+                            }
+                            if (decision.SkillIndex.HasValue)
+                            {
+                                desiredSkillIndex = decision.SkillIndex.Value;
+                            }
+
+                            debugStage = decision.DebugStage;
+                            debugRotationType = decision.DebugRotationType;
+                            debugRotationCount = decision.DebugRotationCount;
+                            debugRawSelection = decision.DebugRawSelection;
+                            debugResolvedActivityId = decision.DebugResolvedActivityId;
+                            debugHasAiConfig = decision.DebugHasAiConfig;
+                            debugHasLoadout = decision.DebugHasLoadout;
+                            debugSelectedWeaponIndex = decision.DebugSelectedWeaponIndex;
+                            debugSelectedWeaponSkillCount = decision.DebugSelectedWeaponSkillCount;
+
+                            debugPreferredEnemyId = decision.DebugPreferredEnemyId;
+                            debugChosenEnemyId = decision.DebugChosenEnemyId;
+                            debugChosenEnemyTeamId = decision.DebugChosenEnemyTeamId;
+                            debugChosenEnemyTeamAi = decision.DebugChosenEnemyTeamAi;
+                            debugChosenEnemyControlPlayerId = decision.DebugChosenEnemyControlPlayerId;
+                            debugChosenEnemyControlAi = decision.DebugChosenEnemyControlAi;
+                            debugChosenEnemyIsPlayersPlayerCharacter = decision.DebugChosenEnemyIsPlayersPlayerCharacter;
+                            debugChosenEnemyInteractiveObject = decision.DebugChosenEnemyInteractiveObject;
+                            debugEnemyPick = decision.DebugEnemyPick;
+                            debugEnemyReason = decision.DebugEnemyReason;
+                            debugEnemyX = decision.DebugEnemyX;
+                            debugEnemyY = decision.DebugEnemyY;
+                            debugEnemyCandidateCount = decision.DebugEnemyCandidateCount;
+                            debugReachableCellCount = decision.DebugReachableCellCount;
+                            debugReducingCellCount = decision.DebugReducingCellCount;
+                            debugAvoidedImmediateBacktrack = decision.DebugAvoidedImmediateBacktrack;
+                            debugCurrentDistToEnemy = decision.DebugCurrentDistToEnemy;
+                            debugChosenMoveDistToEnemy = decision.DebugChosenMoveDistToEnemy;
+                            debugChosenMoveDefensiveCover = decision.DebugChosenMoveDefensiveCover;
+                            debugChosenMoveTargetCover = decision.DebugChosenMoveTargetCover;
+                            debugChosenMoveScore = decision.DebugChosenMoveScore;
+                            debugChosenMoveChanceToHit = decision.DebugChosenMoveChanceToHit;
+                            debugChosenMoveWithinWalkRange = decision.DebugChosenMoveWithinWalkRange;
+                            debugProfileRange = decision.DebugProfileRange;
+                            debugShotDistanceToTarget = decision.DebugShotDistanceToTarget;
+                            debugShotChanceToHit = decision.DebugShotChanceToHit;
+
+                            if (decision.TargetEntity != null)
+                            {
+                                targetPos = TryGetAgentGridPositionOrDefault(decision.TargetEntity);
+                            }
+                            else
+                            {
+                                targetPos = decision.TargetPosition;
+                            }
+
+                            foundActionableDecision = true;
+                            break;
+                        }
+
                         decisionNote = decision == null ? "null-decision" : "no-action";
 
                         if (decision != null)
@@ -370,13 +395,22 @@ namespace Shadowrun.LocalService.Core.Simulation
                             debugShotChanceToHit = decision.DebugShotChanceToHit;
                         }
                     }
+                    catch
+                    {
+                        decisionNote = "exception";
+                        debugStage = "exception";
+                    }
                 }
-                catch
+
+                if (!foundActionableDecision)
                 {
                     desiredSkill = 0UL;
                     commandName = "AI.EndTeamTurn";
-                    decisionNote = "exception";
-                    debugStage = "exception";
+                    if (string.IsNullOrEmpty(decisionNote))
+                    {
+                        decisionNote = "no-action";
+                        debugStage = "no-target";
+                    }
                 }
             }
 

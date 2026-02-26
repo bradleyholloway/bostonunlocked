@@ -219,6 +219,12 @@ namespace Shadowrun.LocalService.Core.Career
             return GenerateCoop(mapName, identityGuids, careerIndices, slots, playerIds);
         }
 
+        public string GetCompressedCoopMatchConfiguration(string mapName, Guid[] identityGuids, int[] careerIndices, CareerSlot[] slots, ulong[] playerIds, PlayerCharacterSnapshot[][] selectedHenchmenPerPlayer)
+        {
+            // Coop rosters are dynamic and depend on multiple careers; keep uncached.
+            return GenerateCoop(mapName, identityGuids, careerIndices, slots, playerIds, selectedHenchmenPerPlayer);
+        }
+
         private string Generate(string mapName, Guid identityGuid, int careerIndex, string characterName)
         {
             return Generate(mapName, identityGuid, careerIndex, characterName, null, null, 1UL);
@@ -368,10 +374,15 @@ namespace Shadowrun.LocalService.Core.Career
 
         private string GenerateCoop(string mapName, Guid[] identityGuids, int[] careerIndices, CareerSlot[] slots)
         {
-            return GenerateCoop(mapName, identityGuids, careerIndices, slots, null);
+            return GenerateCoop(mapName, identityGuids, careerIndices, slots, null, null);
         }
 
         private string GenerateCoop(string mapName, Guid[] identityGuids, int[] careerIndices, CareerSlot[] slots, ulong[] playerIds)
+        {
+            return GenerateCoop(mapName, identityGuids, careerIndices, slots, playerIds, null);
+        }
+
+        private string GenerateCoop(string mapName, Guid[] identityGuids, int[] careerIndices, CareerSlot[] slots, ulong[] playerIds, PlayerCharacterSnapshot[][] selectedHenchmenPerPlayer)
         {
             try
             {
@@ -420,7 +431,16 @@ namespace Shadowrun.LocalService.Core.Career
                     }
                     human.ID = id;
                     human.PlayerCharacterSnapshot = pcs;
-                    human.Henchmen = new PlayerCharacterSnapshot[0];
+                    if (selectedHenchmenPerPlayer != null
+                        && i < selectedHenchmenPerPlayer.Length
+                        && selectedHenchmenPerPlayer[i] != null)
+                    {
+                        human.Henchmen = selectedHenchmenPerPlayer[i];
+                    }
+                    else
+                    {
+                        human.Henchmen = new PlayerCharacterSnapshot[0];
+                    }
                     coopPlayers.Add(human);
                 }
 

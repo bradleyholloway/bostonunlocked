@@ -39,6 +39,8 @@ namespace Shadowrun.LocalService.Core.AILogic
         private const float RangedCoverPriorityWeightDefensive = 3.00f;
         private const float RangedDetourForCoverMinPriorityGain = 1.25f;
         private const float RangedDetourForCoverMaxChanceDrop = 0.20f;
+        private const ulong AiRepairOwnArmorActivityId = 6070UL;
+        private const ulong ArmorStatusValueId = 458763UL;
 
         private readonly IAiBehaviourConfigLookup _configLookup;
         private readonly ISkillSelectionStrategyFactory _skillSelectionFactory;
@@ -118,32 +120,39 @@ namespace Shadowrun.LocalService.Core.AILogic
                 }
                 else if (TryResolvePendingActivityShot(gameworld, agent, out pendingWeaponIndex, out pendingSkillIndex, out pendingActivityId, out pendingTarget))
                 {
-                    decision.DebugResolvedActivityId = pendingActivityId;
-                    decision.TargetPosition = pendingTarget;
-                    decision.HasAction = true;
-                    decision.SkillId = pendingActivityId;
-                    decision.WeaponIndex = pendingWeaponIndex;
-                    decision.SkillIndex = pendingSkillIndex;
-                    decision.DebugShotDistanceToTarget = TryComputeDistanceToTarget(gameworld, agent, pendingTarget);
-                    float pendingShotChanceToHit;
-                    if (TryComputeShotChanceToHit(gameworld, agent, pendingWeaponIndex, pendingSkillIndex, pendingActivityId, pendingTarget, out pendingShotChanceToHit))
+                    if (IsActivityLikelyNoOpForAgent(gameworld, agent, pendingActivityId))
                     {
-                        decision.DebugShotChanceToHit = pendingShotChanceToHit;
-
-                        if (isRangedProfile && pendingShotChanceToHit < RangedMinAttackChanceToCommit)
+                        decision.DebugStage = "pending-noop";
+                    }
+                    else
+                    {
+                        decision.DebugResolvedActivityId = pendingActivityId;
+                        decision.TargetPosition = pendingTarget;
+                        decision.HasAction = true;
+                        decision.SkillId = pendingActivityId;
+                        decision.WeaponIndex = pendingWeaponIndex;
+                        decision.SkillIndex = pendingSkillIndex;
+                        decision.DebugShotDistanceToTarget = TryComputeDistanceToTarget(gameworld, agent, pendingTarget);
+                        float pendingShotChanceToHit;
+                        if (TryComputeShotChanceToHit(gameworld, agent, pendingWeaponIndex, pendingSkillIndex, pendingActivityId, pendingTarget, out pendingShotChanceToHit))
                         {
-                            decision.DebugStage = "pending-low-cth-deferred";
+                            decision.DebugShotChanceToHit = pendingShotChanceToHit;
+
+                            if (isRangedProfile && pendingShotChanceToHit < RangedMinAttackChanceToCommit)
+                            {
+                                decision.DebugStage = "pending-low-cth-deferred";
+                            }
+                            else
+                            {
+                                decision.DebugStage = "ok-pending";
+                                return decision;
+                            }
                         }
                         else
                         {
                             decision.DebugStage = "ok-pending";
                             return decision;
                         }
-                    }
-                    else
-                    {
-                        decision.DebugStage = "ok-pending";
-                        return decision;
                     }
                 }
 
@@ -232,6 +241,13 @@ namespace Shadowrun.LocalService.Core.AILogic
                         lastResolvedSkillIndex = skillIndex.HasValue ? skillIndex.Value : 0;
                     }
 
+                    if (IsActivityLikelyNoOpForAgent(gameworld, agent, activityId))
+                    {
+                        decision.DebugResolvedActivityId = activityId;
+                        decision.DebugStage = "skip-noop";
+                        continue;
+                    }
+
                     // Pick a target position that would actually produce a target list.
                     IntVector2D chosenTarget;
                     if (TryPickValidTargetPosition(gameworld, agent, weaponIndex ?? 0, skillIndex ?? 0, activityId, out chosenTarget))
@@ -285,6 +301,7 @@ namespace Shadowrun.LocalService.Core.AILogic
                                 decision.DebugChosenMoveScore = moveScore;
                                 decision.DebugChosenMoveChanceToHit = moveChanceToHit;
                                 decision.DebugChosenMoveWithinWalkRange = IsWithinWalkRange(gameworld, agent, preShotMove);
+                                RememberPlannedMove(gameworld, agent, preShotMove);
                                 RememberPendingActivity(agent, weaponIndex ?? 0, skillIndex ?? 0, activityId);
                                 return decision;
                             }
@@ -346,6 +363,7 @@ namespace Shadowrun.LocalService.Core.AILogic
                         decision.DebugChosenMoveScore = debugSetupMoveScore;
                         decision.DebugChosenMoveChanceToHit = debugSetupMoveChanceToHit;
                         decision.DebugChosenMoveWithinWalkRange = IsWithinWalkRange(gameworld, agent, setupPos.Value);
+                        RememberPlannedMove(gameworld, agent, setupPos.Value);
                         RememberPendingActivity(agent, lastResolvedWeaponIndex, lastResolvedSkillIndex, lastResolvedActivityId);
                         return decision;
                     }
@@ -1776,6 +1794,11 @@ namespace Shadowrun.LocalService.Core.AILogic
                         continue;
                     }
 
+                    if (IsImmediateBacktrack(agent, myPos, cell))
+                    {
+                        continue;
+                    }
+
                     if (requireWalkRange && !IsWithinWalkRange(gameworld, agent, cell))
                     {
                         continue;
@@ -2217,6 +2240,91 @@ namespace Shadowrun.LocalService.Core.AILogic
                 }
 
                 return statusValues.GetByIdOrReturnDefault(458755UL) > 0f;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsActivityLikelyNoOpForAgent(IGameworldInstance gameworld, Entity agent, ulong activityId)
+        {
+            try
+            {
+                if (activityId != AiRepairOwnArmorActivityId)
+                {
+                    return false;
+                }
+
+                if (gameworld == null || gameworld.EntitySystem == null || agent == null)
+                {
+                    return false;
+                }
+
+                AttributeBackedStatusValueContainer statusValues;
+                if (!gameworld.EntitySystem.TryGetComponent<AttributeBackedStatusValueContainer>(agent, out statusValues) || statusValues == null)
+                {
+                    return false;
+                }
+
+                StatusValue armor;
+                if (!statusValues.TryGet(ArmorStatusValueId, out armor) || armor == null)
+                {
+                    return false;
+                }
+
+                return armor.IsAtMaximum;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void RememberPlannedMove(IGameworldInstance gameworld, Entity agent, IntVector2D moveTarget)
+        {
+            try
+            {
+                if (gameworld == null || gameworld.EntitySystem == null || agent == null)
+                {
+                    return;
+                }
+
+                IntVector2D from;
+                try
+                {
+                    from = gameworld.EntitySystem.GetAgentGridPosition(agent);
+                }
+                catch
+                {
+                    return;
+                }
+
+                _lastMoveFromByAgentId[agent.Id] = from;
+                _lastMoveToByAgentId[agent.Id] = moveTarget;
+            }
+            catch
+            {
+            }
+        }
+
+        private bool IsImmediateBacktrack(Entity agent, IntVector2D from, IntVector2D to)
+        {
+            try
+            {
+                if (agent == null)
+                {
+                    return false;
+                }
+
+                IntVector2D lastFrom;
+                IntVector2D lastTo;
+                return _lastMoveFromByAgentId.TryGetValue(agent.Id, out lastFrom)
+                    && _lastMoveToByAgentId.TryGetValue(agent.Id, out lastTo)
+                    && from.X == lastTo.X
+                    && from.Y == lastTo.Y
+                    && to.X == lastFrom.X
+                    && to.Y == lastFrom.Y;
             }
             catch
             {
